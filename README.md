@@ -1,5 +1,6 @@
 
 # wardriver.uk Rev3
+[![CI](https://github.com/lukeswitz/wardriver_rev3/actions/workflows/arduinobuild.yml/badge.svg)](https://github.com/lukeswitz/wardriver_rev3/actions/workflows/arduinobuild.yml)
 
 ## Introduction
 
