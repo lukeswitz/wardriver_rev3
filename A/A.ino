@@ -1,7 +1,7 @@
 //Joseph Hewitt 2023
 //This code is for the ESP32 "Side A" of the wardriver hardware revision 3.
 
-const String VERSION = "1.2.0b3";
+const String VERSION = "1.2.0b5";
 
 #include <GParser.h>
 #include <MicroNMEA.h>
@@ -26,6 +26,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 //The stack size is insufficient for the OTA hashing calls. This is 10K, instead of the default 8K.
 SET_LOOP_TASK_STACK_SIZE(10240);
+
+String b_side_hash_full = "unset"; //Set automatically
 
 //These variables are used for buffering/caching GPS data.
 char nmeaBuffer[100];
@@ -54,6 +56,8 @@ unsigned int wifi_count;
 unsigned int disp_gsm_count;
 unsigned int disp_wifi_count;
 boolean is_5ghz = false;
+unsigned long side_b_reset_millis;
+unsigned long started_at_millis;
 
 uint32_t chip_id;
 
@@ -74,6 +78,8 @@ const char* default_psk = "wardriver.uk";
 #define blocklist_len 20
 //Max blocklist entry length. 32 = max SSID len.
 #define blocklist_str_len 32
+//How many file references we are willing to hold from the WiGLE upload history.
+#define wigle_history_len 256
 
 struct mac_addr {
    unsigned char bytes[6];
@@ -99,6 +105,17 @@ struct block_str {
   char characters[blocklist_str_len];
 };
 
+//We need a way to reference a file between this device and WiGLE.net.
+//Use the size + file ID (which is just the bootcounter, which can reset and is not unique).
+//We also want some stats from the server.
+struct wigle_file {
+  unsigned long fid;
+  unsigned long fsize;
+  unsigned long discovered_gps;
+  unsigned long total_gps;
+  boolean wait;
+};
+
 struct mac_addr mac_history[mac_history_len];
 unsigned int mac_history_cursor = 0;
 
@@ -106,6 +123,9 @@ struct cell_tower cell_history[cell_history_len];
 unsigned int cell_history_cursor = 0;
 
 struct block_str block_list[blocklist_len];
+
+struct wigle_file wigle_history[wigle_history_len];
+unsigned int wigle_history_cursor = 0;
 
 unsigned long lcd_last_updated;
 
@@ -118,6 +138,10 @@ TaskHandle_t primary_scan_loop_handle;
 
 boolean b_working = false; //Set to true when we receive some valid data from side B.
 boolean ota_optout = false; //Set in the web interface
+boolean wigle_commercial = false; //Set in the web interface
+boolean wigle_autoupload = false; //Set in the web interface
+String wigle_api_key = ""; //Set in the web interface
+String wigle_username = ""; //Set automatically via API calls
 
 #define DEVICE_UNKNOWN   254
 #define DEVICE_CUSTOM    0
@@ -137,7 +161,14 @@ boolean block_reconfigure = false;
 int web_timeout = 60000; //ms to spend hosting the web interface before booting.
 int gps_allow_stale_time = 60000;
 boolean enforce_valid_binary_checksums = true; //Lookup OTA binary checksums online, prevent installation if no match found
+boolean nets_over_uart = false; //Send discovered networks over UART?
+String ota_hostname = "ota.wardriver.uk";
+unsigned long auto_reset_ms = 0;
+float force_lat = 0;
+float force_lon = 0;
 
+#define MAX_AUTO_RESET_MS 1814400000
+#define MIN_AUTO_RESET_MS 7200000
 
 boolean use_fallback_cert = false;
 
@@ -196,6 +227,310 @@ f0PDdGbXj3H6v/r3fk8syofQM1stfmta/HVCBAo=
 
 // END CERTIFICATES
 
+struct wigle_file get_wigle_file(int fid, unsigned long fsize){
+  //Provide a local fileID (numerical bootcounter part only) and the filesize 
+  //Returns a reference to a WiGLE uploaded file, if it has been uploaded. A zero'd object otherwise.
+
+  for (unsigned int cur = 0; cur < wigle_history_len; cur++){
+    if (wigle_history[cur].fid == 0){
+      //We hit an unpopulated entry, meaning we're at the end.
+      break;
+    }
+    if (wigle_history[cur].fid == fid && wigle_history[cur].fsize){
+      return wigle_history[cur];
+    }
+  }
+
+  //Return the struct with all zeros when we don't have anything.
+  //a fid of zero can't be seen in the wild, so this denotes an invalid/missing response.
+  struct wigle_file wigle_file_reference;
+  wigle_file_reference = (wigle_file){.fid = 0, .fsize = 0, .discovered_gps = 0, .total_gps = 0, .wait = true};
+  return wigle_file_reference;
+}
+
+void wigle_load_history(){
+  wigle_history_cursor = 0;
+  
+  //If authorized, get file uploads from WiGLE and store their references in RAM for later.
+  Serial.println("Will check previous WiGLE uploads");
+  
+  if (!SD.exists("/wigle.crt")){
+    Serial.println("No CA cert file!");
+    return;
+  }
+
+  if (wigle_api_key.length() < 3){
+    Serial.println("Not authorized with WiGLE");
+    return;
+  }
+
+  //This block is duplicated also in wigle_upload, refactor some time?
+  //Current root is 1940, double it in case larger certs are used in the future.
+  #define ca_len 3880
+  byte ca_root[ca_len];
+  Serial.println("Loading CA");
+  File careader = SD.open("/wigle.crt", FILE_READ);
+  if (careader.size() > ca_len-2){
+    Serial.println("wigle.crt too large");
+    return;
+  }
+  careader.read(ca_root, ca_len);
+  careader.close();
+  //^
+  
+  clear_display();
+  display.println("Contacting WiGLE");
+  display.display();
+
+
+  WiFiClientSecure httpsclient;
+  httpsclient.setCACert((char*)ca_root);
+
+  if (!httpsclient.connect("api.wigle.net", 443)){
+    Serial.println("Wigle API connection failed");
+    return;
+  }
+  Serial.println("WIGLE OK");
+  display.println("Connected");
+  display.display();
+
+  httpsclient.println("GET /api/v2/file/transactions?pagestart=0&pageend=300 HTTP/1.0");
+  httpsclient.println("Host: api.wigle.net");
+  httpsclient.println("Connection: close");
+  httpsclient.print("User-Agent: ");
+  httpsclient.println(generate_user_agent());
+  httpsclient.print("Authorization: Basic ");
+  httpsclient.println(wigle_api_key);
+  httpsclient.println();
+
+  boolean headers = true;
+  String lbuf = "";
+  while (httpsclient.connected()){
+    if (headers){
+      lbuf = httpsclient.readStringUntil('\n');
+      if (lbuf.length() < 3){
+        //Blank line, end of headers.
+        headers = false;
+      }
+    } else {
+      int first_pos = 0;
+      int second_pos = 0;
+      
+      lbuf = httpsclient.readStringUntil('}');
+
+      if (lbuf.indexOf("username") > 0){
+        first_pos = lbuf.indexOf("username\":\"")+11;
+        second_pos = lbuf.indexOf("\"", first_pos);
+        String username = lbuf.substring(first_pos, second_pos);
+        if (username.length() > 2 && username.length() < 33){
+          wigle_username = username;
+          username = "";
+        }
+      }
+      
+      String chip_id_str = String(chip_id);
+      if (lbuf.indexOf(chip_id_str) < 0){
+        //No reference to our device, so it was uploaded by something else.
+        continue;
+      }
+
+      first_pos = lbuf.indexOf("wd3-")+4;
+      second_pos = lbuf.indexOf(".", first_pos);
+      String filename_id = lbuf.substring(first_pos, second_pos);
+
+      first_pos = lbuf.indexOf("discoveredGps\":")+15;
+      second_pos = lbuf.indexOf(",", first_pos);
+      String discovered_gps = lbuf.substring(first_pos, second_pos);
+
+      first_pos = lbuf.indexOf("totalGps\":")+10;
+      second_pos = lbuf.indexOf(",", first_pos);
+      String total_gps = lbuf.substring(first_pos, second_pos);
+
+      first_pos = lbuf.indexOf("fileSize\":")+10;
+      second_pos = lbuf.indexOf(",", first_pos);
+      String file_size = lbuf.substring(first_pos, second_pos);
+
+      boolean is_waiting = true;
+      if (lbuf.indexOf("wait\":null") > 0){
+        is_waiting = false;
+      }
+
+      if (wigle_history_cursor < wigle_history_len){
+        struct wigle_file wigle_file_reference;
+        wigle_file_reference = (wigle_file){.fid = (int) filename_id.toInt(), .fsize = (int) file_size.toInt(), .discovered_gps = (int) discovered_gps.toInt(), .total_gps = (int) total_gps.toInt(), .wait = is_waiting};
+        wigle_history[wigle_history_cursor] = wigle_file_reference;
+        wigle_history_cursor++;
+      }
+      
+    }
+  }
+  Serial.print(wigle_history_cursor);
+  Serial.println(" historical uploads found");
+  Serial.println("Connection closed");
+}
+
+boolean wigle_upload(String path){
+  clear_display();
+  display.println("WiGLE Upload");
+  display.display();
+  if (!SD.exists(path)){
+    Serial.println("Wigle upload filepath not found");
+    return false;
+  }
+
+  if (!SD.exists("/wigle.crt")){
+    Serial.println("No CA cert file!");
+    return false;
+  }
+  
+  //Current root is 1940, double it in case larger certs are used in the future.
+  #define ca_len 3880
+  byte ca_root[ca_len];
+  Serial.println("Loading CA");
+  File careader = SD.open("/wigle.crt", FILE_READ);
+  if (careader.size() > ca_len-2){
+    Serial.println("wigle.crt too large");
+    return false;
+  }
+  careader.read(ca_root, ca_len);
+  careader.close();
+
+  String boundary = "wduk";
+  boundary.concat(esp_random());
+  
+  WiFiClientSecure httpsclient;
+  httpsclient.setCACert((char*)ca_root);
+
+  if (!httpsclient.connect("api.wigle.net", 443)){
+    Serial.println("Wigle API connection failed");
+    return false;
+  }
+  Serial.println("WIGLE OK");
+  display.println("Connected");
+  display.display();
+  
+  File filereader = SD.open(path);
+
+  Serial.println("Uploading file to Wigle");
+
+  String nice_filename = generate_filename(path);
+
+  //This is horrible :^)
+  //Content-Disposition headers appear in the HTTP body, this is the calculated size.
+  int cd_header_len = 0;
+  cd_header_len += (boundary.length()+2)*3; //We use the boundary 3 times, double-dashed (the +2)
+  cd_header_len += 2; //The additional double-dash for the final boundary.
+  cd_header_len += 56; //Initial content-disposition filename line, including closing quote
+  cd_header_len += nice_filename.length();
+  cd_header_len += 22; //Content-Type CSV
+  cd_header_len += 45; //Second content-disposition line for "donate" form.
+  if (wigle_commercial){
+    Serial.println("WiGLE commerical optin selected.");
+    cd_header_len += 4; //"on" + \n\r
+  }
+  cd_header_len += 22; //New lines (doubled, because it's CR&LF)
+  Serial.print("Extra content-length bytes for CD headers: ");
+  Serial.println(cd_header_len);
+  
+  httpsclient.println("POST /api/v2/file/upload HTTP/1.0");
+  httpsclient.println("Host: api.wigle.net");
+  httpsclient.println("Connection: close");
+  httpsclient.print("User-Agent: ");
+  httpsclient.println(generate_user_agent());
+  if (wigle_api_key.length() > 2){
+    httpsclient.print("Authorization: Basic ");
+    httpsclient.println(wigle_api_key);
+  }
+  httpsclient.print("Content-Type: multipart/form-data; boundary=");
+  httpsclient.println(boundary);
+  httpsclient.print("Content-Length: ");
+  httpsclient.println(filereader.size()+cd_header_len);
+  
+  boundary = "--" + boundary;
+  //End header:
+  httpsclient.println();
+  //Start content-disposition file header:
+  httpsclient.println(boundary);
+  httpsclient.print("Content-Disposition: form-data; name=\"file\"; filename=\"");
+  httpsclient.print(nice_filename);
+  httpsclient.println("\"");
+  httpsclient.println("Content-Type: text/csv");
+  //End content-disposition file header:
+  httpsclient.println();
+  //Start file body:
+
+  #define CBUFLEN 1024
+  byte cbuf[CBUFLEN];
+  
+  float percent = 0;
+  while (filereader.available()){
+    long bytes_available = filereader.available();
+    int toread = CBUFLEN;
+    if (bytes_available < CBUFLEN){
+      toread = bytes_available;
+    }
+    
+    filereader.read(cbuf, toread);
+    httpsclient.write(cbuf, toread);
+    clear_display();
+    display.println("WiGLE Upload");
+    percent = ((float)filereader.position() / (float)filereader.size()) * 100;
+    display.print(percent);
+    display.println("%");
+    display.display();
+  }
+
+  //httpsclient.write(filereader);
+  //End file body:
+  httpsclient.println();
+  httpsclient.println();
+  //Start content-disposition form header:
+  httpsclient.println(boundary);
+  httpsclient.println("Content-Disposition: form-data; name=\"donate\"");
+  //End content-disposition form header:
+  httpsclient.println();
+  //Start form body:
+  if (wigle_commercial){
+    httpsclient.println("on");
+  }
+  //End content-disposition:
+  httpsclient.print(boundary);
+  httpsclient.println("--");
+  httpsclient.println();
+  httpsclient.flush();
+
+  Serial.println("File transfer complete");
+  clear_display();
+  display.println("Transfer complete");
+  display.display();
+
+  String serverres = "";
+
+  while (httpsclient.connected()){
+    if (httpsclient.available()){
+      char c = httpsclient.read();
+      Serial.write(c);
+      serverres.concat(c);
+    }
+    if (serverres.length() > 1024){
+      Serial.println("Aborting read, large payload");
+      break;
+    }
+  }
+
+  httpsclient.stop();
+
+  Serial.println();
+  Serial.println("WiGLE done, connection closed");
+
+  if (serverres.indexOf("\"success\":true") > -1){
+    Serial.println("Upload success confirmed");
+    return true;
+  }
+  Serial.println("Upload not confirmed");
+  return false;
+}
+
 String ota_get_url(String url, String write_to=""){
   if (ota_optout){
     Serial.println("OTA optout");
@@ -215,7 +550,7 @@ String ota_get_url(String url, String write_to=""){
     Serial.println("primary cert");
     httpsclient.setCACert(PRIMARY_OTA_CERT);
   }
-  if (!httpsclient.connect("ota.wardriver.uk", 443)){
+  if (!httpsclient.connect(ota_hostname.c_str(), 443)){
     Serial.println("failed");
     if (!use_fallback_cert){
       Serial.println("Will retry using fallback cert");
@@ -228,12 +563,11 @@ String ota_get_url(String url, String write_to=""){
     httpsclient.print("GET ");
     httpsclient.print(url);
     httpsclient.println(" HTTP/1.0");
-    httpsclient.println("Host: ota.wardriver.uk");
+    httpsclient.print("Host: ");
+    httpsclient.println(ota_hostname);
     httpsclient.println("Connection: close");
     httpsclient.print("User-Agent: ");
-    httpsclient.print(device_type_string());
-    httpsclient.print(" / ");
-    httpsclient.println(VERSION);
+    httpsclient.println(generate_user_agent());
     httpsclient.println();
   }
   String return_out = "";
@@ -309,6 +643,7 @@ boolean check_for_updates(boolean stable=true, boolean download_now=false){
   int linecount = 0;
   int partcount = 0;
   boolean update_available = false;
+  String server_b_hash = "";
   while (cur <= res.length()){
     char c = res.charAt(cur);
     if (c == '>' || c == '\n'){
@@ -333,6 +668,9 @@ boolean check_for_updates(boolean stable=true, boolean download_now=false){
           ota_latest_beta = partbuf;
         }
       }
+      if (partcount == 4){
+        server_b_hash = partbuf;
+      }
 
       if (stable == reading_stable){
         //This is the branch we are interested in
@@ -350,7 +688,11 @@ boolean check_for_updates(boolean stable=true, boolean download_now=false){
           }
           if (partcount == 6){
             if (download_now){
-              ota_get_url(partbuf, "/B.bin");
+              if (server_b_hash != preferences.getString("b_checksum","x")){
+                ota_get_url(partbuf, "/B.bin");
+              } else {
+                Serial.println("Not downloading B, already installed (hash check)");
+              }
             }
           }
         }
@@ -392,6 +734,14 @@ int get_config_int(String key, int def=0){
   return res.toInt();
 }
 
+float get_config_float(String key, int def=0){
+  String res = get_config_option(key);
+  if (res == ""){
+    return def;
+  }
+  return res.toFloat();
+}
+
 String file_hash(String filename, boolean update_lcd=true, String lcd_prompt="Wardriver busy"){
   File reader = SD.open(filename, FILE_READ);
   //Setup a hash context, and somewhere to keep the output.
@@ -408,7 +758,7 @@ String file_hash(String filename, boolean update_lcd=true, String lcd_prompt="Wa
     bbuf[0] = c;
     mbedtls_sha256_update(&ctx, bbuf, 1);
     i++;
-    if (i > 1800){
+    if (i > 50000){
       i = 0;
       if (update_lcd){
         clear_display();
@@ -422,6 +772,7 @@ String file_hash(String filename, boolean update_lcd=true, String lcd_prompt="Wa
     
   }
   mbedtls_sha256_finish(&ctx, genhash);
+  reader.close();
   return hex_str(genhash, sizeof genhash);
 }
 
@@ -558,6 +909,8 @@ boolean install_firmware(String filepath, String expect_hash = "") {
       Update.write(binbuf,counter);
     }
     Update.end(true);
+
+    binreader.close();
   
     clear_display();
     display.println("Update installed");
@@ -733,7 +1086,7 @@ boolean install_firmware(String filepath, String expect_hash = "") {
       }
       
     }
-    
+    binreader.close();
   }
 
   return true;
@@ -773,6 +1126,86 @@ String get_config_string(String key, String def=""){
   return res;
 }
 
+void wigle_upload_all(){
+  //Automatically upload all new capture files since the feature was enabled to WiGLE.
+  long min_fileid = preferences.getLong("wigle_mf",0);
+  boolean did_upload = false;
+  if (min_fileid == 0){
+    Serial.println("WiGLE autoupload min fileid is 0, refusing to upload!");
+    preferences.putLong("wigle_mf",bootcount);
+    Serial.print("set min fileid to ");
+    Serial.println(bootcount);
+    return;
+  }
+  Serial.println("WiGLE automatic upload..");
+  File dir = SD.open("/");
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      break;
+    }
+    if (!entry.isDirectory()) {
+      String filename = entry.name();
+      if (filename.charAt(0) != '/'){
+        filename = "/";
+        filename.concat(entry.name());
+      }
+      if (!filename.endsWith(".csv")){
+        Serial.print("Bad filetype: ");
+        Serial.println(filename);
+        continue;
+      }
+
+      //Get the bootcount (numerical) part of a filename, for WiGLE references later.
+      String filename_id = "";
+      int first_pos = filename.indexOf("wd3-")+4;
+      int second_pos = filename.indexOf(".", first_pos);
+      filename_id = filename.substring(first_pos, second_pos);
+      unsigned int filename_id_int = (int) filename_id.toInt();
+      if (filename_id_int < min_fileid){
+        Serial.print("Skip ID ");
+        Serial.print(filename_id_int);
+        Serial.print(", less than ");
+        Serial.print(min_fileid);
+        Serial.print(" for file ");
+        Serial.println(filename);
+        continue;
+      } else {
+        Serial.print("File ID ");
+        Serial.print(filename_id_int);
+        Serial.print(" is OK, min is ");
+        Serial.println(min_fileid);
+      }
+
+      struct wigle_file wigle_file_reference = get_wigle_file(filename_id_int, entry.size());
+      
+      Serial.print(filename);
+      Serial.print(" is ");
+      Serial.print(entry.size());
+      Serial.println(" bytes");
+
+      if (wigle_file_reference.fid == 0){
+        Serial.println("Not on WiGLE, will upload");
+        if (wigle_upload(filename)){
+          preferences.putLong("wigle_mf", filename_id_int);
+          delay(2000);
+          did_upload = true;
+        } else {
+          Serial.println("Upload failed. Stopping auto upload now.");
+          return;
+        }
+        
+      }
+    }
+  }
+  Serial.println("Auto upload complete.");
+  if (did_upload){
+    wigle_load_history();
+  } else {
+    Serial.println("Found nothing to upload.");
+  }
+}
+
 void boot_config(){
   //Load configuration variables and perform first time setup if required.
   Serial.println("Setting/loading boot config..");
@@ -784,14 +1217,39 @@ void boot_config(){
   web_timeout = get_config_int("web_timeout", web_timeout);
   gps_allow_stale_time = get_config_int("gps_allow_stale_time", gps_allow_stale_time);
   enforce_valid_binary_checksums = get_config_bool("enforce_checksums", enforce_valid_binary_checksums);
+  nets_over_uart = get_config_bool("nets_over_uart", nets_over_uart);
+  ota_hostname = get_config_string("ota_hostname", ota_hostname);
+  auto_reset_ms = get_config_int("auto_reset_ms", auto_reset_ms);
+  force_lat = get_config_float("force_lat", force_lat);
+  force_lon = get_config_float("force_lon", force_lon);
+
+  if (auto_reset_ms != 0){
+    if (auto_reset_ms > MAX_AUTO_RESET_MS){
+      auto_reset_ms = MAX_AUTO_RESET_MS;
+    }
+    if (auto_reset_ms < MIN_AUTO_RESET_MS){
+      auto_reset_ms = MIN_AUTO_RESET_MS;
+    }
+  }
+  
 
   boolean sb_bw16 = get_config_bool("sb_bw16", false);
   if (sb_bw16){
     is_5ghz = true;
   }
 
+  if (!rotate_display){
+    display.setRotation(2);
+  } else {
+    display.setRotation(0);
+  }
+
   preferences.begin("wardriver", false);
   ota_optout = preferences.getBool("ota_optout", false);
+  b_side_hash_full = preferences.getString("b_checksum","xxxxx");
+  wigle_commercial = preferences.getBool("wigle_com", false);
+  wigle_autoupload = preferences.getBool("wigle_au", false);
+  wigle_api_key = preferences.getString("wigle_api_key", "");
   bool firstrun = preferences.getBool("first", true);
   if (block_reconfigure){
     firstrun = false;
@@ -1000,7 +1458,12 @@ void boot_config(){
   boolean created_network = false; //Set to true automatically when the fallback network is created.
   
   boolean is_stable = true; //Currently running beta or stable, set automatically
+  //Maybe set this to check for any letters, since normal stable version numbers probably don't have any letters.
+  //This should catch rc versions and beta versions though.
   if (VERSION.indexOf("b") > -1){
+    is_stable = false;
+  }
+  if (VERSION.indexOf("r") > -1){
     is_stable = false;
   }
 
@@ -1052,6 +1515,18 @@ void boot_config(){
         Serial.println("Continuing..");
         String ota_test = ota_get_url("/");
         Serial.println(ota_test);
+
+        //Implement a hash check, only run if there's a mismatch.
+        Serial.println("Getting Wigle cert..");
+        SD.remove("/wigle.crt");
+        ota_get_url("/wigle.crt", "/wigle.crt");
+
+        wigle_load_history();
+        if (wigle_autoupload){
+          wigle_upload_all();
+        } else {
+          Serial.println("WiGLE autoupload disabled.");
+        }
 
         update_available = check_for_updates(is_stable, false);
       }
@@ -1128,11 +1603,6 @@ void boot_config(){
                     client.println("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"><h1>wardriver.uk " + device_type_string() + " by Joseph Hewitt</h1></head>");
                     if (update_available && !SD.exists("/A.bin") && !SD.exists("/B.bin")){
                       client.println("<p><a href=\"/dlupdate\">Software update available. Click here to download.</a></p>");
-                      client.print("<p>Latest version: ");
-                      client.print(ota_latest_stable);
-                      client.print(" / Latest beta: ");
-                      client.print(ota_latest_beta);
-                      client.println("</p>");
                     } else {
                       if (created_network){
                         client.println("<p>This device can check for updates automatically if connected to the internet.</p>");
@@ -1145,12 +1615,25 @@ void boot_config(){
                     if (ota_optout){
                       client.println("<p>OTA updates are turned off: <a href=\"/ota_change_pref\">Opt-in</a></p>");
                     }
+
+                    client.print("<p><a href=\"/wigle-setup\">WiGLE Settings</a>");
+                    if (wigle_username.length() > 1){
+                      client.print(" (logged in as ");
+                      client.print(html_escape(wigle_username));
+                      client.print(")");
+                    } else if (wigle_api_key.length() > 2){
+                      client.print(" (login failed)");
+                    } else {
+                      client.print(" (not configured)");
+                    }
+
+                    client.println("</p>");
                     
-                    client.println("<table><tr><th>Filename</th><th>File Size</th><th>Finish Date</th><th>Opt</th></tr>");
+                    client.println("<table><tr><th>File</th><th>Size</th><th>Status</th><th>Opt</th></tr>");
                     Serial.println("Scanning for files");
                     File dir = SD.open("/");
                     while (true) {
-                      File entry =  dir.openNextFile();
+                      File entry = dir.openNextFile();
                       if (!entry) {
                         break;
                       }
@@ -1160,26 +1643,66 @@ void boot_config(){
                           filename = "/";
                           filename.concat(entry.name());
                         }
+
+                        //Get the bootcount (numerical) part of a filename, for WiGLE references later.
+                        String filename_id = "";
+                        int first_pos = filename.indexOf("wd3-")+4;
+                        int second_pos = filename.indexOf(".", first_pos);
+                        filename_id = filename.substring(first_pos, second_pos);
+                        unsigned int filename_id_int = (int) filename_id.toInt();
+
+                        struct wigle_file wigle_file_reference = get_wigle_file(filename_id_int, entry.size());
+                        
                         Serial.print(filename);
                         Serial.print(" is ");
                         Serial.print(entry.size());
                         Serial.println(" bytes");
+
+                        if (wigle_file_reference.fid == 0){
+                          Serial.println("^Not on WiGLE");
+                        } else {
+                          Serial.print("^WiGLE info= discovered:");
+                          Serial.print(wigle_file_reference.discovered_gps);
+                          Serial.print(", total:");
+                          Serial.println(wigle_file_reference.total_gps);
+                        }
+
+                        
                         client.print("<tr><td>");
                         client.print("<a href=\"/download?fn=");
                         client.print(filename);
                         client.print("\">");
                         client.print(filename);
-                        client.print("</a></td><td>");
+                        String file_dt = get_latest_datetime(filename, false);
+                        client.print("</a>");
+                        if (file_dt.length() > 2){
+                          client.print(" from ");
+                          client.print(file_dt);
+                        }
+                        client.print("</td><td>");
                         client.print(entry.size()/1024);
                         client.print(" kb</td><td>");
-                        client.print(get_latest_datetime(filename, false));
-                        client.print("</td>");
-                        client.print("<td>");
+                        if (wigle_file_reference.fid == 0){
+                          client.print("Not uploaded");
+                        } else {
+                          client.print("Uploaded. ");
+                          if (wigle_file_reference.wait != true){
+                            client.print(wigle_file_reference.total_gps);
+                            client.print(" total WiFi (");
+                            client.print(wigle_file_reference.discovered_gps);
+                            client.print(" new)");
+                          } else {
+                            client.print("Not yet processed");
+                          }
+                        }
+                        client.print("</td><td>");
                         if (filename.endsWith(".bin") || filename.endsWith(".csv")){
-                          client.print("<a href=\"/delete?fn=");
+                          client.print("<p><a href=\"/delete?fn=");
                           client.print(filename);
                           client.print("\">");
-                          client.print("DEL</a>");
+                          client.print("Delete</a></p><p><a href=\"/upload?fn=");
+                          client.print(filename);
+                          client.print("\">Upload</a>");
                         }
                         client.println("</td></tr>");
                       }
@@ -1191,9 +1714,24 @@ void boot_config(){
                     client.print("<h2>Upload firmware</h2>");
                     client.print("<p>Your wardriver will automatically find new updates, but you can also manually upload them using this form</p>");
                     client.print("<input type=\"file\" id=\"file\" /><br><button id=\"read-file\">Read File</button>");
-                    client.print("<p>The upload will take 1-3 minutes and there is no progress bar in this browser, check the wardriver LCD during upload</p>");
-                    client.print("<br><br>v");
+                    client.print("<p>The upload will take 1-3 minutes and there is no progress bar in this browser, check the wardriver LCD during upload</p><br>");
+                    client.print("<br><br>Currently installed: v");
                     client.println(VERSION);
+                    
+                    if (ota_latest_stable.length() > 1 || ota_latest_beta.length() > 1){
+                      client.println("<br><hr><strong>Available software versions</strong>");
+                      if (ota_latest_stable.length() > 1 && ota_latest_stable != VERSION){
+                        client.print("<p>Latest stable version: <a href=\"dlupdate?v=s\">");
+                        client.print(ota_latest_stable);
+                        client.print("</a>");
+                      }
+                      if (ota_latest_beta.length() > 1 && ota_latest_beta != VERSION){
+                        client.print("</p><p>Latest beta: <a href=\"/dlupdate?v=b\">");
+                        client.print(ota_latest_beta);
+                        client.print("</a>");
+                      }
+                      client.println("</p><p>Your wardriver should automatically find the best version to install, but you can choose a specific version to install above.");
+                    }
                     //The very bottom of the homepage contains this JS snippet to send the current epoch value from the browser to the wardriver
                     //Also a snippet to force binary uploads instead of multipart.
                     client.println("<script>const ep=Math.round(Date.now()/1e3);var x=new XMLHttpRequest;x.open(\"GET\",\"time?v=\"+ep,!1),x.send(null); document.querySelector(\"#read-file\").addEventListener(\"click\",function(){if(\"\"==document.querySelector(\"#file\").value){alert(\"no file selected\");return}var e=document.querySelector(\"#file\").files[0],n=new FileReader;n.onload=function(n){let t=new XMLHttpRequest;var l=e.name;t.open(\"POST\",\"/fw?n=\"+l,!0),t.onload=e=>{window.location.href=\"/fwup\"};let r=new Blob([n.target.result],{type:\"application/octet-stream\"});t.send(r)},n.readAsArrayBuffer(e)});</script>");
@@ -1213,6 +1751,16 @@ void boot_config(){
                   }
 
                   if (buff.indexOf("GET /dlupdate") > -1){
+                    boolean install_stable = is_stable;
+                    if (buff.indexOf("?v=b") > -1){
+                      install_stable = false;
+                      Serial.println("Requested beta");
+                    }
+                    if (buff.indexOf("?v=s") > -1){
+                      install_stable = true;
+                      Serial.println("Requested stable");
+                    }
+                    
                     client.println("Content-type: text/html");
                     client.println();
                     Serial.println("/dlupdate requested");
@@ -1222,7 +1770,76 @@ void boot_config(){
                     client.flush();
                     delay(5);
                     client.stop();
-                    check_for_updates(is_stable, true);
+                    check_for_updates(install_stable, true);
+                  }
+
+                  if (buff.indexOf("GET /wigle-setup") > -1){
+                    Serial.println("Sending wigle-setup page");
+                    client.println("Content-type: text/html");
+                    client.println();
+                    client.print("<style>html{font-size:21px;text-align:center;padding:20px}input[type=text],input[type=password],input[type=submit],select{padding:5px;width:100%;max-width:1000px}form{padding-top:10px}br{display:block;margin:5px 0}</style>");
+                    client.print("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"><h2>WiGLE Configuration</h2>");
+                    client.print("<p>Your device can upload captured data directly to WiGLE. Please provide a WiGLE API key below. This can be found at https://wigle.net/account</p>");
+                    if (wigle_api_key.length() > 2){
+                      client.print("<p>An API key is already set. Leave the value as 'configured' unless you wish to change it.</p>");
+                    }
+                    client.print("<form method=\"get\" action=\"/wcfg\">API Key ('encoded for use'):<input type=\"text\" name=\"akey\" id=\"akey\" value=\"");
+                    if (wigle_api_key.length() > 2){
+                      client.print("configured");
+                    }
+                    client.print("\"><br><br><input type=\"submit\" value=\"Submit\"><p><label for=\"commercial\"><input type=\"checkbox\" id=\"commercial\" name=\"commercial\" value=\"commercial\" ");
+                    if (wigle_commercial){
+                      client.print("checked");
+                    }
+                    client.println("> Allow WiGLE to use this data commercially</label></p>");
+                    client.print("<p><label for=\"autoupload\"><input type=\"checkbox\" id=\"autoupload\" name=\"autoupload\" value=\"autoupload\" ");
+                    if (wigle_autoupload){
+                      client.print("checked");
+                    }
+                    client.print(">Automatically upload files when device starts up</label></p></form>");
+                    
+                    client.println("<br><hr>Additional help is available at https://wardriver.uk</html>");
+
+                  }
+
+                  if (buff.indexOf("GET /wcfg?") > -1){
+                    Serial.println("Got WiGLE config");
+                    client.println("Content-type: text/html");
+                    client.println();
+                    
+                    if (buff.indexOf("&commercial=commercial") > -1){
+                      wigle_commercial = true;
+                      //Really, lets use POST requests for this soon.
+                      buff.replace("&commercial=commercial","");
+                      Serial.println("WiGLE commercial optin selected");
+                    } else {
+                      wigle_commercial = false;
+                    }
+                    preferences.putBool("wigle_com", wigle_commercial);
+
+                    if (buff.indexOf("&autoupload=autoupload") > -1){
+                      wigle_autoupload = true;
+                      buff.replace("&autoupload=autoupload","");
+                      preferences.putLong("wigle_mf", bootcount);
+                      Serial.println("WiGLE autoupload enabled");
+                    } else {
+                      wigle_autoupload = false;
+                    }
+                    preferences.putBool("wigle_au", wigle_autoupload);
+                    int startpos = buff.indexOf("?akey=")+6;
+                    int endpos = buff.indexOf(" HTTP");
+                    String set_api_key = GP_urldecode(buff.substring(startpos,endpos));
+                    
+                    if (set_api_key != "configured"){
+                      wigle_api_key = set_api_key;
+                    }
+                    
+                    preferences.putString("wigle_api_key", wigle_api_key);
+    
+                    client.print("<h1>Thanks!</h1>Please wait. <meta http-equiv=\"refresh\" content=\"1; URL=/\" />");
+
+                    wigle_load_history();
+                    
                   }
 
                   if (buff.indexOf("GET /ota_change_pref") > -1){
@@ -1267,14 +1884,21 @@ void boot_config(){
                     }
                     if (SD.exists("/B.bin")){
                       String filehash = file_hash("/B.bin");
-                      String check_result = online_hash_check(filehash);
-                      String color = "red";
-                      String emoji = "&#9888;"; //warning
-                      if (check_result != ""){
-                        color = "green";
-                        emoji = "&#128274;"; //lock
+                      String installed_hash = preferences.getString("b_checksum");
+                      if (filehash != installed_hash){
+                        String check_result = online_hash_check(filehash);
+                        String color = "red";
+                        String emoji = "&#9888;"; //warning
+                        if (check_result != ""){
+                          color = "green";
+                          emoji = "&#128274;"; //lock
+                        }
+                        client.println("<tr><td>B.bin</td><td><p style=\"color:" + color + "\">" + filehash + " " + emoji + "</p><p>" + check_result + "</td><td><a href=\"/fwins?h=" + filehash + "&n=/B.bin\">Install</a></td></tr>");
+                      } else {
+                        Serial.print("B hash matches installed hash, deleting ");
+                        Serial.println(filehash);
+                        SD.remove("/B.bin");
                       }
-                      client.println("<tr><td>B.bin</td><td><p style=\"color:" + color + "\">" + filehash + " " + emoji + "</p><p>" + check_result + "</td><td><a href=\"/fwins?h=" + filehash + "&n=/B.bin\">Install</a></td></tr>");
                     }
                     client.println("</tr></body>");
                     
@@ -1308,6 +1932,11 @@ void boot_config(){
                         display.println("Update failed");
                         display.display();
                         delay(5000);
+                      } else {
+                        //Install worked.
+                        if (fw_filename == "/B.bin"){
+                          preferences.putString("b_checksum", expect_hash);
+                        }
                       }
                     } else {
                       client.print("<h1>Error verifying update</h1>");
@@ -1395,6 +2024,42 @@ void boot_config(){
                     }
                   }
 
+                  if (buff.indexOf("GET /upload?") > -1) {
+                    Serial.println("File upload request");
+                    int startpos = buff.indexOf("?fn=")+4;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String filename = buff.substring(startpos,endpos);
+                    Serial.println(filename);
+                    if (!SD.exists(filename)){
+                      Serial.println("file does not exist");
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("<h1>File not found </h1>");
+                      client.println("<meta http-equiv=\"refresh\" content=\"1; URL=/\" />");
+                    } else {
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("<style>html,td,th{font-size:21px;text-align:center;padding:20px}</style><html>");
+                      client.print("<h1>Uploading");
+                      client.print(filename);
+                      client.print("</h1><h2>Check LCD for progress");
+                      client.print("</h2>Once complete, <a href=\"/\">click here</a> to continue.</html>");
+                      client.flush();
+                      delay(5);
+                      client.stop();
+                      boolean success = wigle_upload(filename);
+                      Serial.print("Success? ");
+                      Serial.println(success);
+                      if (success == true){
+                        clear_display();
+                        display.println("Uploaded OK");
+                        display.display();
+                        delay(1000);
+                        wigle_load_history();
+                      }
+                    }
+                  }
+
                   if (buff.indexOf("GET /delete?") > -1) {
                     Serial.println("File delete pre-request");
                     int startpos = buff.indexOf("?fn=")+4;
@@ -1453,12 +2118,16 @@ void boot_config(){
                     Serial.println(filename);
                     if (!filename.endsWith(".csv") && filename != "/test.txt"){
                       //Prevent accessing non-csv files, with the exception of test.txt
+                      Serial.println("Not allowed");
                       client.println("Content-type: text/html");
                       client.println();
                       client.print("Not allowed");
                       client.flush();
                       delay(5);
                       client.stop();
+                      buff = "";
+                      filename = "";
+                      break;
                     }
 
                     File reader = SD.open(filename, FILE_READ);
@@ -1476,11 +2145,7 @@ void boot_config(){
                       client.println("Content-type: text/csv");
                       Serial.println("Sending file");
                       client.print("Content-Disposition: attachment; filename=\"");
-                      client.print(get_latest_datetime(filename, true));
-                      client.print("_");
-                      client.print(chip_id);
-                      client.print("_");
-                      client.print(filename);
+                      client.print(generate_filename(filename));
                       client.println("\"");
                       client.print("Content-Length: ");
                       client.print(reader.size());
@@ -1489,13 +2154,17 @@ void boot_config(){
                       client.flush();
                       delay(2);
                       client.write(reader);
+                      reader.close();
                     }
                   }
-    
-                  client.print("\n\r\n\r");
-                  client.flush();
-                  delay(5);
-                  client.stop();
+
+                  
+                  if (client.connected()){
+                    client.print("\n\r\n\r");
+                    client.flush();
+                    delay(5);
+                    client.stop();
+                  }
                   buff = "";
                   disconnectat = millis() + web_timeout;
                 }
@@ -1632,11 +2301,18 @@ void setup() {
     while (!filewriter){
       filewriter = SD.open("/test.txt", FILE_APPEND);
       if (!filewriter){
-        Serial.println("Failed to open file for writing.");
+        Serial.println("Failed to open file for writing. Type continue to skip this check.");
         clear_display();
         display.println("SD File open failed!");
         display.display();
-        delay(1000);
+        String sbuff = Serial.readStringUntil('\n');
+        if (sbuff.indexOf("continue") >= 0){
+          //Since this boot is tethered to a PC and has no local storage, override some stuff.
+          nets_over_uart = true;
+          block_reconfigure = true;
+          web_timeout = 250;
+          break;
+        }
       }
     }
     int wrote = filewriter.print("\n_BOOT_");
@@ -1650,11 +2326,18 @@ void setup() {
     filewriter.flush();
     if (wrote < 1){
       while(true){
-        Serial.println("Failed to write to SD card!");
+        Serial.println("Failed to write to SD card! Type continue to resume boot process.");
         clear_display();
         display.println("SD Card write failed!");
         display.display();
-        delay(4000);
+        String sbuff = Serial.readStringUntil('\n');
+        if (sbuff.indexOf("continue") >= 0){
+          //Since this boot is tethered to a PC and has no local storage, override some stuff.
+          nets_over_uart = true;
+          block_reconfigure = true;
+          web_timeout = 250;
+          break;
+        }
       }
     }
 
@@ -1668,6 +2351,18 @@ void setup() {
     boot_config();
     setup_wifi();
 
+    if (!rotate_display){
+      display.setRotation(2);
+    } else {
+      display.setRotation(0);
+    }
+
+    #define hash_log_len 5
+    String b_side_hash = "";
+    for (int x = 0; x < hash_log_len; x++){
+      b_side_hash.concat(b_side_hash_full.charAt(x));
+    }
+
     Serial2.begin(gps_baud_rate);
 
     Serial.print("This device: ");
@@ -1677,6 +2372,8 @@ void setup() {
     filewriter.print(bootcount);
     filewriter.print(", ep=");
     filewriter.print(epoch);
+    filewriter.print(", bsh=");
+    filewriter.print(b_side_hash);
     filewriter.flush();
     filewriter.close();
 
@@ -1723,6 +2420,7 @@ void setup() {
     clear_display();
     display.println("Starting main..");
     display.display();
+    started_at_millis = millis();
 
     xTaskCreatePinnedToCore(
       primary_scan_loop, /* Function to implement the task */
@@ -1774,7 +2472,10 @@ void primary_scan_loop(void * parameter){
             }
           }
           
-          filewriter.printf("%s,%s,%s,%s,%d,%d,%s,WIFI\n", WiFi.BSSIDstr(i).c_str(), ssid.c_str(), security_int_to_string(WiFi.encryptionType(i)).c_str(), dt_string().c_str(), WiFi.channel(i), WiFi.RSSI(i), gps_string().c_str());
+          filewriter.printf("%s,%s,%s,%s,%d,%d,%s,WIFI\n", this_bssid, ssid.c_str(), security_int_to_string(WiFi.encryptionType(i)).c_str(), dt_string().c_str(), WiFi.channel(i), WiFi.RSSI(i), gps_string().c_str());
+          if (nets_over_uart){
+            Serial.printf("NET=%s,%s,%s,%s,%d,%d,%s,WIFI\n", this_bssid, ssid.c_str(), security_int_to_string(WiFi.encryptionType(i)).c_str(), dt_string().c_str(), WiFi.channel(i), WiFi.RSSI(i), gps_string().c_str());
+          }
          
         }
       }
@@ -1825,7 +2526,8 @@ void lcd_show_stats(){
       display.println("No GSM pos");
     }
   }
-  if (b_working){
+  #define B_RESET_SEARCH_TIME 20000
+  if (b_working && millis() - side_b_reset_millis > B_RESET_SEARCH_TIME){
   display.print("BLE:");
   display.print(ble_count);
   if (ble_did_block){
@@ -1834,7 +2536,11 @@ void lcd_show_stats(){
   display.print(" GSM:");
   display.println(disp_gsm_count);
   } else {
-    display.println("ESP-B NO DATA");
+    if (millis() - side_b_reset_millis > B_RESET_SEARCH_TIME){
+      display.println("ESP-B NO DATA");
+    } else {
+      display.println("ESP-B RESET");
+    }
   }
   display.println(dt_string());
   display.display();
@@ -1870,14 +2576,17 @@ void loop(){
         }
       }
     }
-    Serial.println(bside_buffer);
     String towrite = "";
     towrite = parse_bside_line(bside_buffer);
     if (towrite.length() > 1){
-      Serial.println(towrite);
       filewriter.print(towrite);
       filewriter.print("\n");
       filewriter.flush();
+      if (nets_over_uart){
+        Serial.print("NET=");
+        Serial.print(towrite);
+        Serial.print("\n");
+      }
     }
     
   }
@@ -1887,6 +2596,15 @@ void loop(){
   if (lcd_last_updated == 0 || millis() - lcd_last_updated > 1000){
     lcd_show_stats();
     lcd_last_updated = millis();
+  }
+  if (auto_reset_ms != 0 && millis() > auto_reset_ms){
+    Serial.println("AUTO RESET TIMER REACHED");
+    clear_display();
+    display.println("AUTO RESET");
+    display.println("Timer reached.");
+    display.display();
+    delay(1250);
+    ESP.restart();
   }
 }
 
@@ -2033,14 +2751,6 @@ boolean seen_mac(unsigned char* mac){
   return false;
 }
 
-void print_mac(struct mac_addr mac){
-  //Print a mac_addr struct nicely.
-  for (int x = 0; x < 6 ; x++){
-    Serial.print(mac.bytes[x],HEX);
-    Serial.print(":");
-  }
-}
-
 boolean mac_cmp(struct mac_addr addr1, struct mac_addr addr2){
   //Return true if 2 mac_addr structs are equal.
   for (int y = 0; y < 6 ; y++){
@@ -2113,6 +2823,34 @@ String parse_bside_line(String buff){
     }
   }
 
+  if (buff.indexOf("RESET=") > -1) {
+    if (millis() - started_at_millis < 10000){
+      //We will ignore this if we recently started running because then it's normal behavior, not a fault.
+      Serial.print("IGNORING: ");
+      Serial.println(buff);
+      return out;
+    }
+    String b_reset_reason = buff;
+    b_reset_reason.replace("RESET=","");
+    b_reset_reason.replace("\r","");
+    b_reset_reason.replace("\n","");
+    Serial.print("Side B reports reset, code ");
+    Serial.println(b_reset_reason);
+    File testfilewriter = SD.open("/test.txt", FILE_APPEND);
+    testfilewriter.print("\n\r_B-RST_");
+    testfilewriter.print(b_reset_reason);
+    testfilewriter.print(",ut=");
+    testfilewriter.print(millis());
+    testfilewriter.print(",blc=");
+    testfilewriter.println(ble_count);
+    testfilewriter.close();
+    b_working = false;
+    side_b_reset_millis = millis();
+
+    return out;
+
+  }
+
   if (buff.indexOf("WI0,") > -1) {
     //WI0,SSID,6,-88,5,00:00:00:00:00:00
     int startpos = buff.indexOf("WI0,")+4;
@@ -2157,8 +2895,6 @@ String parse_bside_line(String buff){
       if (!seen_mac(mac_bytes)){
         save_mac(mac_bytes);
         //Save to SD?
-        Serial.print("NEW WIFI (SIDE B): ");
-        Serial.println(buff);
 
         String authtype = security_int_to_string((int) security_raw.toInt());
         
@@ -2294,9 +3030,6 @@ String dt_string(){
   strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ts);
   String out = String(buf);
   
-  Serial.print("New dt_str: ");
-  Serial.println(out);
-  
   return out;
 }
 
@@ -2373,6 +3106,12 @@ String gps_string(){
   //The module we are using has a precision of 2.5m, accuracy can never be better than that.
   if (accuracy <= 2.5){
     accuracy = 2.5;
+  }
+
+  if (force_lat != 0 && force_lon != 0){
+    lats = String(force_lat, 6);
+    lons = String(force_lon, 6);
+    accuracy = 1;
   }
 
   out = lats + "," + lons + "," + altf + "," + accuracy;
@@ -2457,6 +3196,7 @@ String get_latest_datetime(String filename, boolean date_only){
             Serial.print("Stripped to: ");
             Serial.println(dt);
           }
+          reader.close();
           return dt;
         } 
       }
@@ -2469,6 +3209,7 @@ String get_latest_datetime(String filename, boolean date_only){
       }
     }
   }
+  reader.close();
   return "";
 }
 
@@ -2482,9 +3223,6 @@ void update_epoch(){
     }
     epoch += tdiff_sec;
     epoch_updated_at = millis();
-    Serial.print("Added ");
-    Serial.print(tdiff_sec);
-    Serial.println(" seconds to epoch");
     return;
   }
   
@@ -2615,6 +3353,7 @@ struct coordinates get_cell_pos(String wigle_key){
   }
   Serial.print("read lines: ");
   Serial.println(lines);
+  filereader.close();
   return toreturn;
 }
 
@@ -2827,7 +3566,8 @@ String get_config_option(String key){
       Serial.print(cfgkey);
       Serial.print(" equal to ");
       Serial.println(value);
-    
+
+      filereader.close();
       return value;
     }
     
@@ -2835,7 +3575,28 @@ String get_config_option(String key){
   
   Serial.print("Did not find ");
   Serial.println(key);
+  filereader.close();
   
   return "";
   
+}
+
+String generate_filename(String filepath){
+  //Actual filenames on the SD card are kept short due to FAT32 restrictions, this function gives us a nicer name.
+  String fname = "";
+  fname.concat(get_latest_datetime(filepath, true));
+  fname.concat("_");
+  fname.concat(chip_id);
+  fname.concat("_");
+  fname.concat(filepath);
+  fname.replace("/","_");
+  return fname;
+}
+
+String generate_user_agent(){
+  String ret = "wardriver.uk - ";
+  ret.concat(device_type_string());
+  ret.concat(" / ");
+  ret.concat(VERSION);
+  return ret;
 }
