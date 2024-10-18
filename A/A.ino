@@ -9,6 +9,7 @@ const String VERSION = "1.2.1";
 #include "SD.h"
 #include "SPI.h" 
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <Preferences.h>
 #include <time.h>
 #include <Update.h>
