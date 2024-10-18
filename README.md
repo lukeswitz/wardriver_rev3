@@ -1,6 +1,9 @@
+[![CI](https://github.com/lukeswitz/wardriver_rev3/actions/workflows/arduinobuild.yml/badge.svg)](https://github.com/lukeswitz/wardriver_rev3/actions/workflows/arduinobuild.yml)
 
 # wardriver.uk Rev3
-[![CI](https://github.com/lukeswitz/wardriver_rev3/actions/workflows/arduinobuild.yml/badge.svg)](https://github.com/lukeswitz/wardriver_rev3/actions/workflows/arduinobuild.yml)
+
+> [!NOTE]
+> This fork has options you might not need or want. **Review** and use at your own risk.
 
 ## Introduction
 
