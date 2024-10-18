@@ -92,12 +92,12 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
           String ble_name = advertisedDevice.getName().c_str();
           ble_name.replace(",","_");
           
-          Serial1.print("BL,");
-          Serial1.print(advertisedDevice.getRSSI());
-          Serial1.print(",");
-          Serial1.print(advertisedDevice.getAddress().toString().c_str());
-          Serial1.print(",");
-          Serial1.println(ble_name);
+          // Serial1.print("BL,");
+          // Serial1.print(advertisedDevice.getRSSI());
+          // Serial1.print(",");
+          // Serial1.print(advertisedDevice.getAddress().toString().c_str());
+          // Serial1.print(",");
+          // Serial1.println(ble_name);
         }
       }
     }
