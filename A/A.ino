@@ -742,14 +742,26 @@ boolean check_for_updates(boolean stable=true, boolean download_now=false){
   return update_available;
 }
 
-void setup_wifi(){
-  //Gets the WiFi ready for scanning by disconnecting from networks and changing mode.
-  //Turn off entirely to cleanup any references to active networks
+void setup_wifi() {
+  // Generate random MAC address
+  uint8_t randomMAC[6];
+  randomMAC[0] = (random(0, 256) & 0xFE);  // Ensure first byte's LSB is 0 (unicast)
+  for (int i = 1; i < 6; i++) {
+    randomMAC[i] = random(0, 256);  // Randomize remaining bytes
+  }
+
+  // Turn off Wi-Fi to clean up any references to active networks
   WiFi.mode(WIFI_OFF);
   delay(250);
+
+  // Set the random MAC address before reconnecting
+  esp_wifi_set_mac(WIFI_IF_STA, &randomMAC[0]);
+
+  // Reinitialize Wi-Fi in station mode and disconnect from any previous connections
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 }
+
 
 void clear_display(){
   //Clears the LCD and resets the cursor.
