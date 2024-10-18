@@ -9,6 +9,7 @@ const String VERSION = "1.2.1";
 #include "SD.h"
 #include "SPI.h" 
 #include <WiFi.h>
+#include "esp_wifi.h"
 #include <Preferences.h>
 #include <time.h>
 #include <Update.h>
@@ -743,23 +744,28 @@ boolean check_for_updates(boolean stable=true, boolean download_now=false){
 }
 
 void setup_wifi() {
-  // Generate random MAC address
-  uint8_t randomMAC[6];
-  randomMAC[0] = (random(0, 256) & 0xFE);  // Ensure first byte's LSB is 0 (unicast)
+  // Generate a random MAC address, ensuring bit 0 of the first byte is 0 (unicast)
+  uint8_t newMACAddress[6];
+  newMACAddress[0] = (random(0, 256) & 0xFE);  // First byte, LSB = 0 (unicast)
   for (int i = 1; i < 6; i++) {
-    randomMAC[i] = random(0, 256);  // Randomize remaining bytes
+    newMACAddress[i] = random(0, 256);  // Randomize the remaining bytes
   }
 
-  // Turn off Wi-Fi to clean up any references to active networks
+  // Turn off Wi-Fi to reset and clean up any references to active networks
   WiFi.mode(WIFI_OFF);
   delay(250);
 
-  // Set the random MAC address before reconnecting
-  esp_wifi_set_mac(WIFI_IF_STA, &randomMAC[0]);
+  // Set the new random MAC address
+  esp_wifi_set_mac(WIFI_IF_STA, &newMACAddress[0]);
 
   // Reinitialize Wi-Fi in station mode and disconnect from any previous connections
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
+
+  // Print the new MAC address
+  Serial.printf("New MAC Address: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                newMACAddress[0], newMACAddress[1], newMACAddress[2],
+                newMACAddress[3], newMACAddress[4], newMACAddress[5]);
 }
 
 

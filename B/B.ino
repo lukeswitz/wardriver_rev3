@@ -6,6 +6,7 @@
 //Serial2 = SIM800L module, 9600
 
 #include <WiFi.h>
+#include "esp_wifi.h"
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
