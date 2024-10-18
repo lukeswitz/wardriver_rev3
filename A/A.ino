@@ -1,7 +1,7 @@
 //Joseph Hewitt 2023
 //This code is for the ESP32 "Side A" of the wardriver hardware revision 3.
 
-const String VERSION = "1.2.0b5";
+const String VERSION = "1.2.1";
 
 #include <GParser.h>
 #include <MicroNMEA.h>
@@ -15,6 +15,7 @@ const String VERSION = "1.2.0b5";
 #include "mbedtls/sha256.h"
 #include "mbedtls/md.h"
 #include <WiFiClientSecure.h>
+#include <nvs_flash.h>
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -33,7 +34,6 @@ String b_side_hash_full = "unset"; //Set automatically
 char nmeaBuffer[100];
 MicroNMEA nmea(nmeaBuffer, sizeof(nmeaBuffer));
 unsigned long lastgps = 0;
-String last_dt_string = "";
 String last_lats = "";
 String last_lons = "";
 
@@ -58,6 +58,7 @@ unsigned int disp_wifi_count;
 boolean is_5ghz = false;
 unsigned long side_b_reset_millis;
 unsigned long started_at_millis;
+unsigned long total_new_wifi = 0;
 
 uint32_t chip_id;
 
@@ -130,8 +131,6 @@ unsigned int wigle_history_cursor = 0;
 unsigned long lcd_last_updated;
 
 #define YEAR_2020 1577836800 //epoch value for 1st Jan 2020; dates older than this are considered wrong (this code was written after 2020).
-unsigned long epoch;
-unsigned long epoch_updated_at;
 const char* ntpServer = "pool.ntp.org";
 
 TaskHandle_t primary_scan_loop_handle;
@@ -149,6 +148,7 @@ String wigle_username = ""; //Set automatically via API calls
 #define DEVICE_REV3_5    2
 #define DEVICE_REV4      3
 #define DEVICE_REV3_5GM  4
+#define DEVICE_CSF_MINI  5
 byte DEVICE_TYPE = DEVICE_UNKNOWN;
 
 #define HTTP_TIMEOUT_MS 750
@@ -166,6 +166,7 @@ String ota_hostname = "ota.wardriver.uk";
 unsigned long auto_reset_ms = 0;
 float force_lat = 0;
 float force_lon = 0;
+boolean sb_bw16 = false; 
 
 #define MAX_AUTO_RESET_MS 1814400000
 #define MIN_AUTO_RESET_MS 7200000
@@ -203,25 +204,25 @@ IY8r4D96F4ocMmptiPuXifjDkGbXPqfnJhwhaMA=
 
 static const char *FALLBACK_OTA_CERT = R"EOF(
 -----BEGIN CERTIFICATE-----
-MIIDeTCCAmGgAwIBAgIUVVQV77r10CIDzeIiJGof4TbN6c8wDQYJKoZIhvcNAQEL
-BQAwTDELMAkGA1UEBhMCTkwxCzAJBgNVBAgMAlpIMRUwEwYDVQQKDAx3YXJkcml2
-ZXIudWsxGTAXBgNVBAMMEG90YS53YXJkcml2ZXIudWswHhcNMjMwNzA4MTc0NjIx
-WhcNMjUwMjI3MTc0NjIxWjBMMQswCQYDVQQGEwJOTDELMAkGA1UECAwCWkgxFTAT
-BgNVBAoMDHdhcmRyaXZlci51azEZMBcGA1UEAwwQb3RhLndhcmRyaXZlci51azCC
-ASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAOIc25lsZ2DUBkPgXh79wJK9
-qm4SbpznQXfhevCOQvQrIk3aD2K1J2C+6hK8ORzl8YYyu5KRWWf9t3XrB2PHWw5c
-t4/LhXl/DXSE25RHqr9+ZW2fv26/1p8rjOY7tA2iTGDrBkuED9pQL9lJcBty4In3
-tWP/eUQezmKsMLBTTRRwN3EvylwOikIpK6nEsxQ3SxMp2lq7lVg5g5aGWb9OYzCY
-kcglSJf6bTlmyQQz/qPJ9zyyHGogL8ktSqcutAPRMXmMUvpeMtABH4Ej75etrjQp
-8xp3pbRCoKJtVWd0x48sY4vLXhqNRf+GuXrJTK1CldmAyIhUmNHYzYde0BS53GsC
-AwEAAaNTMFEwHQYDVR0OBBYEFJbqVybpgKmbP50jP93J8/k6DxDMMB8GA1UdIwQY
-MBaAFJbqVybpgKmbP50jP93J8/k6DxDMMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZI
-hvcNAQELBQADggEBADdYOy4mUdmfBzBhJV5pS1ch+AzRD9dTtP/wP9RdzzXXy03t
-54DuM9Xld2evRbhKRRvT1r5GaWoPVWgg7D0Iy4yw08Q91AaOhOpknRyL4KJm4mYs
-4Y9hcGn0dqFsTkRqCkPxTDi0bE9n2ssNsjYupHKSzawM+ESTcXDrAACyAwGLOvvZ
-/pVgZwdi/DGnFk7hn9s9A5+regXDRnUt36TDH2ArAdGHJIl64n+UtpOCoYUIbRA+
-XECvNDA4pMiGiTyH3kPsCeoVK+PY7YX1TMg9gY3QbobSHh4LJ2zH6I+kqDhej/Nr
-f0PDdGbXj3H6v/r3fk8syofQM1stfmta/HVCBAo=
+MIIDgTCCAmmgAwIBAgIUPCSsdEWm6C+RS/JoFaREpBmwqMMwDQYJKoZIhvcNAQEL
+BQAwUDELMAkGA1UEBhMCTkwxCzAJBgNVBAgMAlpIMRkwFwYDVQQKDBBvdGEud2Fy
+ZHJpdmVyLnVrMRkwFwYDVQQDDBBvdGEud2FyZHJpdmVyLnVrMB4XDTI0MTAwNTEx
+MDA1MloXDTI1MTAwNTExMDA1MlowUDELMAkGA1UEBhMCTkwxCzAJBgNVBAgMAlpI
+MRkwFwYDVQQKDBBvdGEud2FyZHJpdmVyLnVrMRkwFwYDVQQDDBBvdGEud2FyZHJp
+dmVyLnVrMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsyLzjymRag1m
+esKhQMPEJSM05YvSZYQfh7gIYDmjTbETRkQ530HR2CA9eMF45BjmzZ7Tn3W5rxBE
+kh3uH1YwELgPV0nNCIvoJEAF1vseYqkRH4zFxlqf6hXKrBn8NJ1gmDuDovul86AO
+ahi505xt/2iXXDXjTks0f/HkVkSRiKIOP6V7XluuNBN5nDpESCZ0bglL2dy7qy9O
+LTzN9raX7qLzThjnx69Flc4TFtixk/02taedw8ZH7bedBts3duS/ODMzAipaXIqj
+paEBfFnjfan2A9nLJwHPS7g0Ec4KR3syifLU1ff+N79rHtGCZjnVG9Bn70vYXwA5
+PfxTs+9ctQIDAQABo1MwUTAdBgNVHQ4EFgQU0iKKwPG/hNN5l5K5t7jVsDUmbegw
+HwYDVR0jBBgwFoAU0iKKwPG/hNN5l5K5t7jVsDUmbegwDwYDVR0TAQH/BAUwAwEB
+/zANBgkqhkiG9w0BAQsFAAOCAQEAUky/qKRmIdK0N9n9aSDZLjm3KBHUsr+9BV85
+i9B8LRhfPEq42tTYBdppNatShz5DKwQSW3tzoVJZkWWd/Lz8/K78eTQ1x//rc4cL
+SzjKNiSvx61xJ+WFdczTUmmnAoI4LW83gAUCUOGzZ5PCCiG8h2XRz/C3snN89IN+
+PghVRXsXxN9cE0ZpzGZcnKY0l6x2qNdX92j6RBjrmQ7kKRDaVGswcezCaxy3kgUC
+4Q8nhWv5EzWfwtlY7QZ6WmKwpqWe1PpR7JQz/2wbQDLvJNhDrK+fFk/+8//6ZkgT
+wZj2V+gRCHJi8TgvXDv6rnR/BXSM0Gh/uEXo1Ev5q4YmgUZCVw==
 -----END CERTIFICATE-----
 )EOF";
 
@@ -246,6 +247,33 @@ struct wigle_file get_wigle_file(int fid, unsigned long fsize){
   struct wigle_file wigle_file_reference;
   wigle_file_reference = (wigle_file){.fid = 0, .fsize = 0, .discovered_gps = 0, .total_gps = 0, .wait = true};
   return wigle_file_reference;
+}
+
+unsigned long get_epoch(boolean await_valid=false) {
+  //Return epoch from system clock.
+
+  time_t now;
+  struct tm timeinfo;
+  if (await_valid){
+    //This seems to just loop for ~5sec or until the date is valid. Possibly required for NTP?
+    if (!getLocalTime(&timeinfo)) {
+      return(0);
+    }
+  }
+  time(&now);
+  return now;
+}
+
+String dt_string(time_t now=0){
+  //Return a datetime String from a time_t epoch value
+  struct tm ts;
+  char buf[80];
+
+  ts = *localtime(&now);
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ts);
+  String out = String(buf);
+
+  return out;
 }
 
 void wigle_load_history(){
@@ -716,6 +744,9 @@ boolean check_for_updates(boolean stable=true, boolean download_now=false){
 
 void setup_wifi(){
   //Gets the WiFi ready for scanning by disconnecting from networks and changing mode.
+  //Turn off entirely to cleanup any references to active networks
+  WiFi.mode(WIFI_OFF);
+  delay(250);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 }
@@ -1210,6 +1241,11 @@ void boot_config(){
   //Load configuration variables and perform first time setup if required.
   Serial.println("Setting/loading boot config..");
 
+  if (DEVICE_TYPE == DEVICE_CSF_MINI){
+    // CoD_Segfault Mini Wardriver Rev2 always has a BW16
+    sb_bw16 = true;
+  }
+
   gps_baud_rate = get_config_int("gps_baud_rate", gps_baud_rate);
   rotate_display = get_config_bool("rotate_display", rotate_display);
   block_resets = get_config_bool("block_resets", block_resets);
@@ -1222,6 +1258,7 @@ void boot_config(){
   auto_reset_ms = get_config_int("auto_reset_ms", auto_reset_ms);
   force_lat = get_config_float("force_lat", force_lat);
   force_lon = get_config_float("force_lon", force_lon);
+  sb_bw16 = get_config_bool("sb_bw16", sb_bw16);
 
   if (auto_reset_ms != 0){
     if (auto_reset_ms > MAX_AUTO_RESET_MS){
@@ -1232,8 +1269,6 @@ void boot_config(){
     }
   }
   
-
-  boolean sb_bw16 = get_config_bool("sb_bw16", false);
   if (sb_bw16){
     is_5ghz = true;
   }
@@ -1267,13 +1302,19 @@ void boot_config(){
   preferences.putShort("model", DEVICE_TYPE);
   
   if (doreset){
-    Serial.println("resetting");
+    Serial.println("Will factory reset now.");
     clear_display();
     display.println("RESET");
     display.display();
     preferences.clear();
-    delay(2000);
-    firstrun = true;
+    preferences.end();
+    Serial.println("Resetting NVS..");
+    nvs_flash_erase();
+    delay(500);
+    nvs_flash_init();
+    delay(1000);
+    Serial.println("Rebooting..");
+    ESP.restart();
   }
 
   if (!firstrun && !block_resets){
@@ -1290,12 +1331,22 @@ void boot_config(){
   }
 
   if (firstrun){
+    // Always set the reset flag on unitilized wardrivers so they will have a full NVS reset on each reboot.
+    // This fixes an issue where NVS could be corrupt preventing a wardriver from being setup without a full flash erase.
+    preferences.putBool("reset", true);
+    preferences.end();
+    delay(100);
+    preferences.begin("wardriver", false);
+
+    setup_wifi();
     Serial.println("Begin first time setup..");
     int n = WiFi.scanNetworks(false,false,false,150);
     Serial.print("Scan result is ");
     Serial.println(n);
     Serial.print("Connect to: ");
     Serial.println(default_ssid);
+    Serial.println(default_psk);
+    WiFi.mode(WIFI_AP);
     WiFi.softAP(default_ssid.c_str(), default_psk);
     IPAddress IP = WiFi.softAPIP();
     clear_display();
@@ -1303,6 +1354,7 @@ void boot_config(){
     display.println(default_ssid);
     display.println(IP);
     display.display();
+    delay(500);
     WiFiServer server(80);
     server.begin();
     boolean newline = false;
@@ -1440,6 +1492,12 @@ void boot_config(){
         
       }//client
     } //firstrun
+
+    // During firstrun: "reset" always forced to true. Set it back to false now we're done.
+    preferences.putBool("reset", false);
+    preferences.end();
+    delay(100);
+    preferences.begin("wardriver", false);
     
   }
   setup_wifi();
@@ -1447,12 +1505,12 @@ void boot_config(){
   bootcount++;
   preferences.putULong("bootcount", bootcount);
 
-  String con_ssid = GP_urldecode(preferences.getString("ssid",""));
-  String con_psk = GP_urldecode(preferences.getString("psk",""));
+  String con_ssid = preferences.getString("ssid","");
+  String con_psk = preferences.getString("psk","");
   con_ssid = get_config_string("con_ssid", con_ssid);
   con_psk = get_config_string("con_psk", con_psk);
-  String fb_ssid = GP_urldecode(preferences.getString("fbssid",""));
-  String fb_psk = GP_urldecode(preferences.getString("fbpsk",""));
+  String fb_ssid = preferences.getString("fbssid","");
+  String fb_psk = preferences.getString("fbpsk","");
   fb_ssid = get_config_string("fb_ssid", fb_ssid);
   fb_psk = get_config_string("fb_psk", fb_psk);
   boolean created_network = false; //Set to true automatically when the fallback network is created.
@@ -1473,30 +1531,34 @@ void boot_config(){
     display.print("Connecting");
     display.display();
     if (con_ssid != ""){
-      WiFi.begin(con_ssid.c_str(), con_psk.c_str());
+      WiFi.begin(con_ssid, con_psk);
       
       int fcount = 0;
       while (WiFi.status() != WL_CONNECTED) {
         display.print(".");
         display.display();
-        delay(100);
+        delay(150);
         Serial.print(".");
         fcount++;
-        if (fcount > 50){
+        if (fcount > 75){
           clear_display();
-          display.println("Cannot connect to WiFi");
+          display.println("WiFi connect failed");
           display.display();
           delay(500);
           if (fb_ssid != ""){
+            WiFi.mode(WIFI_AP);
             WiFi.softAP(fb_ssid.c_str(), fb_psk.c_str());
             created_network = true;
+            delay(500);
           }
           break;
         }
       }
     } else {
+      WiFi.mode(WIFI_AP);
       WiFi.softAP(fb_ssid.c_str(), fb_psk.c_str());
       created_network = true;
+      delay(500);
     }
     Serial.println();
     boolean update_available = false;
@@ -1508,10 +1570,9 @@ void boot_config(){
         display.display();
         Serial.println("Connected, getting the time");
         configTime(0, 0, ntpServer);
-        epoch = getTime();
-        epoch_updated_at = millis();
+
         Serial.print("Time is now set to ");
-        Serial.println(epoch);
+        Serial.println(get_epoch(true));
         Serial.println("Continuing..");
         String ota_test = ota_get_url("/");
         Serial.println(ota_test);
@@ -1652,21 +1713,6 @@ void boot_config(){
                         unsigned int filename_id_int = (int) filename_id.toInt();
 
                         struct wigle_file wigle_file_reference = get_wigle_file(filename_id_int, entry.size());
-                        
-                        Serial.print(filename);
-                        Serial.print(" is ");
-                        Serial.print(entry.size());
-                        Serial.println(" bytes");
-
-                        if (wigle_file_reference.fid == 0){
-                          Serial.println("^Not on WiGLE");
-                        } else {
-                          Serial.print("^WiGLE info= discovered:");
-                          Serial.print(wigle_file_reference.discovered_gps);
-                          Serial.print(", total:");
-                          Serial.println(wigle_file_reference.total_gps);
-                        }
-
                         
                         client.print("<tr><td>");
                         client.print("<a href=\"/download?fn=");
@@ -2011,15 +2057,14 @@ void boot_config(){
                     int endpos = buff.indexOf(" ",startpos);
                     String newtime_str = buff.substring(startpos,endpos);
                     unsigned long newtime = atol(newtime_str.c_str());
-                    if (epoch < YEAR_2020){
+                    if (get_epoch() < YEAR_2020){
                       //if the epoch value is set to something before 2020, we can be quite sure it is inaccurate.
                       if (newtime > YEAR_2020){
                         //A very basic validity test for the datetime value issued by the client.
                         Serial.println("Current clock is inaccurate, using time from client");
-                        epoch = newtime;
+                        set_sys_clock(newtime);
                         Serial.print("epoch is now ");
-                        Serial.println(epoch);
-                        epoch_updated_at = millis();
+                        Serial.println(get_epoch());
                       }
                     }
                   }
@@ -2267,6 +2312,8 @@ void setup() {
       delay(4000);
     }
     delay(1500);
+
+    setup_id_pins();
   
     if(!SD.begin()){
         Serial.println("SD Begin failed!");
@@ -2298,6 +2345,34 @@ void setup() {
     uint64_t cardSize = SD.cardSize() / (1024 * 1024);
     Serial.printf("SD Card Size: %lluMB\n", cardSize);
 
+    Serial.println("Attempting GPS date/time sync..");
+
+    Serial2.begin(gps_baud_rate,SERIAL_8N1,16,17);
+
+    for (int x = 0; x < 3000; x++){
+      int c_count = 0;
+      while (Serial2.available()){
+        c_count++;
+        if (c_count > 128){
+          break;
+        }
+        char c = Serial2.read();
+        if (nmea.process(c)){
+          if (nmea.isValid()){
+            lastgps = millis();
+            gps_time_sync();
+          }
+        }
+      }
+      if (dt_string_from_gps() != ""){
+        break;
+      }
+      delay(1);
+    }
+    gps_time_sync();
+    Serial.print("Date/time is now: ");
+    Serial.println(dt_string_from_gps());
+
     while (!filewriter){
       filewriter = SD.open("/test.txt", FILE_APPEND);
       if (!filewriter){
@@ -2323,6 +2398,8 @@ void setup() {
     filewriter.print(reset_reason);
     filewriter.print(", id=");
     filewriter.print(chip_id);
+    filewriter.print(", bid=");
+    filewriter.print(read_id_pins());
     filewriter.flush();
     if (wrote < 1){
       while(true){
@@ -2363,15 +2440,13 @@ void setup() {
       b_side_hash.concat(b_side_hash_full.charAt(x));
     }
 
-    Serial2.begin(gps_baud_rate);
-
     Serial.print("This device: ");
     Serial.println(device_type_string());
     
     filewriter.print(", bc=");
     filewriter.print(bootcount);
     filewriter.print(", ep=");
-    filewriter.print(epoch);
+    filewriter.print(get_epoch());
     filewriter.print(", bsh=");
     filewriter.print(b_side_hash);
     filewriter.flush();
@@ -2409,12 +2484,29 @@ void setup() {
     
     Serial.println("Opening destination file for writing");
 
-    String filename = "/wd3-";
-    filename = filename + bootcount;
-    filename = filename + ".csv";
+    String filename = "";
+    while (filename == "" || SD.exists(filename)){
+      filename = "/wd3-";
+      filename = filename + bootcount;
+      filename = filename + ".csv";
+      if (SD.exists(filename)){
+        Serial.print("File already exists at ");
+        Serial.print(filename);
+        bootcount++;
+        filename = "";
+        preferences.begin("wardriver", false);
+        preferences.putULong("bootcount", bootcount);
+        preferences.end();
+        Serial.print("Incremented bootcount to ");
+        Serial.println(bootcount);
+      }
+    }
+    Serial.print("Opening file for main session: ");
     Serial.println(filename);
     filewriter = SD.open(filename, FILE_APPEND);
-    filewriter.print("WigleWifi-1.4,appRelease=" + VERSION + ",model=wardriver.uk " + device_type_string() + ",release=1.0.0,device=wardriver.uk " + device_type_string() + ",display=i2c LCD,board=wardriver.uk " + device_type_string() + ",brand=JHewitt\nMAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+    
+    filewriter.print("WigleWifi-1.4,appRelease=wardriver.uk " + VERSION + ",model=" + device_type_string() + ",release=wardriver.uk " + VERSION + ",device=" + device_string() + ",display=i2c LCD,board=" + device_board_string() + ",brand=" + device_brand_string() + "\n");
+    filewriter.println("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type");
     filewriter.flush();
     
     clear_display();
@@ -2434,14 +2526,20 @@ void setup() {
 
 void primary_scan_loop(void * parameter){
   //This core will be dedicated entirely to WiFi scanning in an infinite loop.
+  setup_wifi();
   while (true){
     disp_wifi_count = wifi_count;
     wifi_count = 0;
-    setup_wifi();
-    for(int scan_channel = 1; scan_channel < 14; scan_channel++){
+    for(int scan_channel = 1; scan_channel < 12; scan_channel++){
       yield();
       //scanNetworks(bool async, bool show_hidden, bool passive, uint32_t max_ms_per_chan, uint8_t channel)
       int n = WiFi.scanNetworks(false,true,false,110,scan_channel);
+      if (n < 0){
+        //Got a scan error, add a delay to allow other tasks on this core to run and to hopefully let WiFi issues settle down
+        Serial.print("SCAN FAILURE ");
+        Serial.println(n);
+        delay(1000);
+      }
       if (n > 0){
         wifi_count = wifi_count + n;
         for (int i = 0; i < n; i++) {
@@ -2455,6 +2553,8 @@ void primary_scan_loop(void * parameter){
           }
           //Save the AP MAC inside the history buffer so we know it's logged.
           save_mac(this_bssid_raw);
+
+          total_new_wifi++;
 
           String ssid = WiFi.SSID(i);
           ssid.replace(",","_");
@@ -2472,9 +2572,9 @@ void primary_scan_loop(void * parameter){
             }
           }
           
-          filewriter.printf("%s,%s,%s,%s,%d,%d,%s,WIFI\n", this_bssid, ssid.c_str(), security_int_to_string(WiFi.encryptionType(i)).c_str(), dt_string().c_str(), WiFi.channel(i), WiFi.RSSI(i), gps_string().c_str());
+          filewriter.printf("%s,%s,%s,%s,%d,%d,%s,WIFI\n", this_bssid, ssid.c_str(), security_int_to_string(WiFi.encryptionType(i)).c_str(), dt_string(get_epoch()).c_str(), WiFi.channel(i), WiFi.RSSI(i), gps_string().c_str());
           if (nets_over_uart){
-            Serial.printf("NET=%s,%s,%s,%s,%d,%d,%s,WIFI\n", this_bssid, ssid.c_str(), security_int_to_string(WiFi.encryptionType(i)).c_str(), dt_string().c_str(), WiFi.channel(i), WiFi.RSSI(i), gps_string().c_str());
+            Serial.printf("NET=%s,%s,%s,%s,%d,%d,%s,WIFI\n", this_bssid, ssid.c_str(), security_int_to_string(WiFi.encryptionType(i)).c_str(), dt_string(get_epoch()).c_str(), WiFi.channel(i), WiFi.RSSI(i), gps_string().c_str());
           }
          
         }
@@ -2528,13 +2628,15 @@ void lcd_show_stats(){
   }
   #define B_RESET_SEARCH_TIME 20000
   if (b_working && millis() - side_b_reset_millis > B_RESET_SEARCH_TIME){
-  display.print("BLE:");
+  display.print("BL:");
   display.print(ble_count);
   if (ble_did_block){
     display.print("X");
   }
   display.print(" GSM:");
-  display.println(disp_gsm_count);
+  display.print(disp_gsm_count);
+  display.print(" T:");
+  display.println(total_new_wifi);
   } else {
     if (millis() - side_b_reset_millis > B_RESET_SEARCH_TIME){
       display.println("ESP-B NO DATA");
@@ -2542,7 +2644,7 @@ void lcd_show_stats(){
       display.println("ESP-B RESET");
     }
   }
-  display.println(dt_string());
+  display.println(dt_string(get_epoch()));
   display.display();
   if (gsm_count > 0){
     disp_gsm_count = gsm_count;
@@ -2552,13 +2654,11 @@ void lcd_show_stats(){
 
 void loop(){
   //The main loop for the second core; handles GPS, "Side B" communication, and LCD refreshes.
-  update_epoch();
   while (Serial2.available()){
     char c = Serial2.read();
     if (nmea.process(c)){
       if (nmea.isValid()){
         lastgps = millis();
-        update_epoch();
       }
     }
   }
@@ -2594,6 +2694,7 @@ void loop(){
     disp_gsm_count = gsm_count;
   }
   if (lcd_last_updated == 0 || millis() - lcd_last_updated > 1000){
+    gps_time_sync();
     lcd_show_stats();
     lcd_last_updated = millis();
   }
@@ -2818,7 +2919,7 @@ String parse_bside_line(String buff){
         Serial.println(buff);
 
         mac_str.toUpperCase();
-        out = mac_str + "," + ble_name + "," + "[BLE]," + dt_string() + ",0," + rssi + "," + gps_string() + ",BLE";
+        out = mac_str + "," + ble_name + "," + "[BLE]," + dt_string(get_epoch()) + ",0," + rssi + "," + gps_string() + ",BLE";
       }
     }
   }
@@ -2842,7 +2943,9 @@ String parse_bside_line(String buff){
     testfilewriter.print(",ut=");
     testfilewriter.print(millis());
     testfilewriter.print(",blc=");
-    testfilewriter.println(ble_count);
+    testfilewriter.print(ble_count);
+    testfilewriter.print(",ep=");
+    testfilewriter.println(get_epoch());
     testfilewriter.close();
     b_working = false;
     side_b_reset_millis = millis();
@@ -2894,11 +2997,11 @@ String parse_bside_line(String buff){
     
       if (!seen_mac(mac_bytes)){
         save_mac(mac_bytes);
-        //Save to SD?
+        total_new_wifi++;
 
         String authtype = security_int_to_string((int) security_raw.toInt());
         
-        out = mac_str + "," + ssid + "," + authtype + "," + dt_string() + "," + channel + "," + rssi + "," + gps_string() + ",WIFI";
+        out = mac_str + "," + ssid + "," + authtype + "," + dt_string(get_epoch()) + "," + channel + "," + rssi + "," + gps_string() + ",WIFI";
       }
     }
     
@@ -2973,7 +3076,7 @@ String parse_bside_line(String buff){
         tower.pos = cell_pos;
       }
       
-      out = wigle_cell_key + "," + cell_operator + ",GSM;" + mccmnc + "," + dt_string() + "," + arfcn + "," + rssi_int + "," + gps_string() + ",GSM";
+      out = wigle_cell_key + "," + cell_operator + ",GSM;" + mccmnc + "," + dt_string(get_epoch()) + "," + arfcn + "," + rssi_int + "," + gps_string() + ",GSM";
       save_cell(tower);
     } else {
       //We've seen this tower, get the full object so we can see if anything is missing
@@ -3020,23 +3123,10 @@ String parse_bside_line(String buff){
   return out;
 }
 
-String dt_string(){
-  //Return a datetime String using local timekeeping and GPS data.
-  time_t now = epoch;
-  struct tm ts;
-  char buf[80];
-
-  ts = *localtime(&now);
-  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ts);
-  String out = String(buf);
-  
-  return out;
-}
-
 String dt_string_from_gps(){
   //Return a datetime String using GPS data only.
   String datetime = "";
-  if (nmea.isValid() && nmea.getYear() > 0){
+  if (nmea.getYear() > 0){
     datetime += nmea.getYear();
     datetime += "-";
     datetime += nmea.getMonth();
@@ -3048,9 +3138,6 @@ String dt_string_from_gps(){
     datetime += nmea.getMinute();
     datetime += ":";
     datetime += nmea.getSecond();
-    last_dt_string = datetime;
-  } else if (lastgps + gps_allow_stale_time > millis()) {
-    datetime = last_dt_string;
   }
   return datetime;
 }
@@ -3168,83 +3255,90 @@ String security_int_to_string(int security_type){
 
 String get_latest_datetime(String filename, boolean date_only){
   //Provide a filename to get the highest datetime from that Wigle CSV file on the SD card.
-  Serial.print("Getting latest dt from ");
-  Serial.println(filename);
   String buff = "";
   
   File reader = SD.open(filename, FILE_READ);
-  int seekto = reader.size()-512;
-  if (seekto < 1){
-    seekto = 0;
-  }
-  reader.seek(seekto);
-  int ccount = 0;
-  while (reader.available()){
-    char c = reader.read();
-    if (c == '\n' || c == '\r'){
-      if (ccount == 10){
-        int startpos = buff.indexOf("],2");
-        int endpos = buff.indexOf(",",startpos+3);
-        if (startpos > 0 && endpos > 0){
-          String dt = buff.substring(startpos+2,endpos);
-          Serial.print("Got: ");
-          Serial.println(dt);
-          if (date_only){
-            int spacepos = dt.indexOf(" ");
-            String new_dt = dt.substring(0,spacepos);
-            dt = new_dt;
-            Serial.print("Stripped to: ");
+  time_t meta_lastwrite = reader.getLastWrite();
+  String dt = "";
+  if (meta_lastwrite > YEAR_2020){
+    dt = dt_string(meta_lastwrite);
+  } else {
+    int seekto = reader.size()-512;
+    if (seekto < 1){
+      seekto = 0;
+    }
+    reader.seek(seekto);
+    int ccount = 0;
+    while (reader.available()){
+      char c = reader.read();
+      if (c == '\n' || c == '\r'){
+        if (ccount == 10){
+          int startpos = buff.indexOf("],2");
+          int endpos = buff.indexOf(",",startpos+3);
+          if (startpos > 0 && endpos > 0){
+            dt = buff.substring(startpos+2,endpos);
+            Serial.print("Got (old method): ");
             Serial.println(dt);
-          }
-          reader.close();
-          return dt;
-        } 
-      }
-      ccount = 0;
-      buff = "";
-    } else {
-      buff.concat(c);
-      if (c == ','){
-        ccount++;
+            break;
+          } 
+        }
+        ccount = 0;
+        buff = "";
+      } else {
+        buff.concat(c);
+        if (c == ','){
+          ccount++;
+        }
       }
     }
   }
   reader.close();
-  return "";
+  if (date_only){
+    int spacepos = dt.indexOf(" ");
+    String new_dt = dt.substring(0,spacepos);
+    dt = new_dt;
+    Serial.print("Stripped to: ");
+    Serial.println(dt);
+  }
+  return dt;
 }
 
-void update_epoch(){
-  //Update the global epoch variable using the GPS time source.
+boolean set_sys_clock(unsigned long new_epoch){
+  //Wrapper function to set sys clock to epoch value using standard POSIX functions
+
+  struct timeval val;
+  int ret;
+
+  val.tv_sec = new_epoch;
+  val.tv_usec = 0;
+  ret = settimeofday(&val, NULL);
+
+  if (ret == 0){
+    return true;
+  } else {
+    return false;
+  }
+}
+
+void gps_time_sync(){
+  //Sync the time with GPS data if available.
+
   String gps_dt = dt_string_from_gps();
-  if (!nmea.isValid() || lastgps == 0 || gps_dt.length() < 5){
-    unsigned int tdiff_sec = (millis()-epoch_updated_at)/1000;
-    if (tdiff_sec < 1){
-      return;
-    }
-    epoch += tdiff_sec;
-    epoch_updated_at = millis();
+  if (gps_dt.length() < 5){
     return;
   }
-  
+
   struct tm tm;
+  unsigned long this_epoch = 0;
 
   strptime(gps_dt.c_str(), "%Y-%m-%d %H:%M:%S", &tm );
-  epoch = mktime(&tm);
-  epoch_updated_at = millis();
-}
+  this_epoch = (unsigned long)mktime(&tm);
 
-unsigned long getTime() {
-  //Use NTP to get the current epoch value.
-  
-  time_t now;
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    return(0);
+  if (this_epoch < YEAR_2020){
+    return;
   }
-  time(&now);
-  Serial.print("Got time from NTP: ");
-  Serial.println(now);
-  return now;
+
+  set_sys_clock(this_epoch);
 }
 
 struct coordinates get_cell_pos(String wigle_key){
@@ -3450,8 +3544,60 @@ String device_type_string(){
       ret = "generic";
       break;
 
+    case DEVICE_CSF_MINI:
+      ret = "Mini Wardriver Rev2";
+      break;
+
     default:
       ret = "generic";
+      break;
+  }
+  
+  return ret;
+}
+
+String device_brand_string(){
+  String ret = "JHewitt";
+  switch (DEVICE_TYPE){
+    case DEVICE_CSF_MINI:
+      ret = "CoD_Segfault";
+      break;
+
+    default:
+      ret = "JHewitt";
+      break;
+  }
+
+  return ret;
+}
+
+String device_string(){
+  // Used for the "device" parameter in WiGLE CSV headers.
+  String ret = "";
+  switch (DEVICE_TYPE){
+    case DEVICE_CSF_MINI:
+      ret = "tim";
+      break;
+
+    default:
+      ret = "wardriver.uk " + device_type_string();
+      break;
+  }
+  
+  return ret;
+}
+
+String device_board_string(){
+  // Used for the "board" parameter in WiGLE CSV headers.
+  String ret = "";
+  switch (DEVICE_TYPE){
+    case DEVICE_CSF_MINI:
+      ret = "tim";
+      break;
+
+    default:
+      ret = "wardriver.uk " + device_type_string();
+      break;
   }
   
   return ret;
@@ -3461,6 +3607,17 @@ byte identify_model(){
   //Block until we know for sure what hardware model this is. Can take a while so cache the response.
   //Return a byte indicating the model, such as DEVICE_REV3.
   //Only call *before* the main loops start, otherwise multiple threads could be trying to access the serial.
+
+  //Start by reading board/PCB identifier pins, since this responds immediately.
+  byte board_id = read_id_pins();
+  switch(board_id){
+    case 1:
+      DEVICE_TYPE = DEVICE_CSF_MINI; // CoD_Segfault Mini Wardriver Rev2
+      return DEVICE_TYPE;
+    default:                         // No board ID, continue with identification
+      break;
+  }
+
 
   if (is_5ghz && DEVICE_TYPE == DEVICE_REV3){
     //We already determined we're REV3, but now we have 5Ghz. Must be modded.
@@ -3599,4 +3756,26 @@ String generate_user_agent(){
   ret.concat(" / ");
   ret.concat(VERSION);
   return ret;
+}
+
+void setup_id_pins(){
+  //The following pins are used for board identification
+  pinMode(13, INPUT_PULLDOWN); // IO13 is A/B identifier pin
+  pinMode(25, INPUT_PULLDOWN); // All other pins are board identifers
+  pinMode(26, INPUT_PULLDOWN);
+  pinMode(32, INPUT_PULLDOWN);
+  pinMode(33, INPUT_PULLDOWN);
+}
+
+byte read_id_pins(){
+  //Read a byte denoting the board ID, used for device identification
+  byte board_id = 0;
+  board_id = digitalRead(25);                     // shift bits to get a board ID
+  board_id = (board_id << 1) + digitalRead(26);
+  board_id = (board_id << 1) + digitalRead(32);
+  board_id = (board_id << 1) + digitalRead(33);
+
+  Serial.print("Board ID = ");
+  Serial.println(board_id);
+  return board_id;
 }

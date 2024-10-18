@@ -46,6 +46,10 @@ int ble_found = 0; //The number of BLE devices found in a single scan, sent to s
 int wifi_scan_channel = 1; //The channel to scan (increments automatically)
 
 void setup_wifi(){
+  //Gets the WiFi ready for scanning by disconnecting from networks and changing mode.
+  //Turn off entirely to cleanup any references to active networks
+  WiFi.mode(WIFI_OFF);
+  delay(250);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 }
@@ -72,17 +76,16 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
         ble_found++;
         if (!seen_mac(mac_bytes)){
           save_mac(mac_bytes);
+
+          String ble_name = advertisedDevice.getName().c_str();
+          ble_name.replace(",","_");
           
-          await_serial();
-          serial_lock = true;
-          Serial.printf("Advertised Device: %s \n", advertisedDevice.toString().c_str());
           Serial1.print("BL,");
           Serial1.print(advertisedDevice.getRSSI());
           Serial1.print(",");
           Serial1.print(advertisedDevice.getAddress().toString().c_str());
           Serial1.print(",");
-          Serial1.println(advertisedDevice.getName().c_str());
-          serial_lock = false;
+          Serial1.println(ble_name);
         }
       }
     }
@@ -161,6 +164,17 @@ void setup() {
   Serial1.print("RESET=");
   Serial1.println(reset_reason);
 
+  setup_id_pins();
+  byte board_id = read_id_pins();
+
+  switch(board_id){
+    case 1:                 // CoD_Segfault Mini Wardriver Rev2
+      using_bw16 = true;    // All units have BW16
+      break;
+    default:                // Any boards not using ID pins will be assumed 
+      break;                // to rely on config files for all parameters
+  }
+
   Serial.println("Waiting for config vars");
   Serial1.println("SEND_CONF");
   Serial1.flush();
@@ -215,7 +229,7 @@ void setup() {
     Serial.println("Using BW16 instead of SIM800L");
   }
 
-  Serial2.begin(baud_rate); //SIM800L/BW16
+  Serial2.begin(baud_rate,SERIAL_8N1,16,17); //SIM800L/BW16
   delay(50);
   if (!using_bw16){
     Serial.println("Requesting data from SIM");
@@ -254,8 +268,8 @@ void setup() {
   pBLEScan = BLEDevice::getScan(); //create new scan
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
   pBLEScan->setActiveScan(false); //active scan uses more power, but get results faster
-  pBLEScan->setInterval(50);
-  pBLEScan->setWindow(40);  // less or equal setInterval value
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(50);  // less or equal setInterval value
 
 
   Serial.println("Setting up multithreading");
@@ -264,7 +278,7 @@ void setup() {
       "loop2", /* Name of the task */
       10000,  /* Stack size in words */
       NULL,  /* Task input parameter */
-      0,  /* Priority of the task */
+      3,  /* Priority of the task */
       &loop2handle,  /* Task handle. */
       0); /* Core where the task should run */
 
@@ -378,9 +392,10 @@ void loop() {
       }
     }
   }
-  BLEScanResults foundDevices = pBLEScan->start(2.2, false);
+
   await_serial();
   serial_lock = true;
+  BLEScanResults* foundDevices = pBLEScan->start(1.8, false);
   Serial1.print("BLC,");
   Serial1.println(ble_found);
   serial_lock = false;
@@ -388,6 +403,7 @@ void loop() {
   Serial.println(ble_found);
   Serial.println("Scan done!");
   pBLEScan->clearResults();   // delete results fromBLEScan buffer to release memory
+  yield();
   ble_found = 0;
   if (last_temperature == 0 || millis() - last_temperature > 15000){
     read_temperature();
@@ -395,8 +411,8 @@ void loop() {
     last_temperature = millis();
   }
   
-  //This side will only scan the primary non-overlapping channels; most scan time is dedicated to Bluetooth here.
-  for (int y = 0; y < 4; y++){
+  //This side will only scan a subset of channels defined below; most scan time is dedicated to Bluetooth here.
+  for (int y = 0; y < 6; y++){
     switch(wifi_scan_channel){
       case 1:
         wifi_scan_channel = 6;
@@ -405,6 +421,12 @@ void loop() {
         wifi_scan_channel = 11;
         break;
       case 11:
+        wifi_scan_channel = 12;
+        break;
+      case 12:
+        wifi_scan_channel = 13;
+        break;
+      case 13:
         wifi_scan_channel = 14;
         break;
       default:
@@ -443,6 +465,8 @@ void loop2( void * parameter) {
   boolean had_gsm_data = false;
   int count_5ghz = 0;
   while (true) {
+    yield();
+    delay(10);
     while (Serial1.available()){
       //ESP A rarely talks to us, but it's usually important
       String a_buff = Serial1.readStringUntil('\n');
@@ -536,6 +560,7 @@ void loop2( void * parameter) {
           
         }
         
+        await_serial();
         serial_lock = true;
         Serial.printf("WI%d,%s,%d,%d,%d,%s\n", 0, ssid.c_str(), channel, rssi, enc_type, mac.c_str());
         Serial1.printf("WI%d,%s,%d,%d,%d,%s\n", 0, ssid.c_str(), channel, rssi, enc_type, mac.c_str());
@@ -546,9 +571,12 @@ void loop2( void * parameter) {
         if (using_bw16){
           if (s2buf.indexOf("[ATWS]") > -1){
             had_gsm_data = true;
+            await_serial();
+            serial_lock = true;
             Serial1.print("5G,");
             Serial1.print(count_5ghz);
             Serial1.print("\n");
+            serial_lock = false;
             Serial.print("BW16 done, 5GHz count: ");
             Serial.println(count_5ghz);
             count_5ghz = 0;
@@ -620,3 +648,22 @@ void clear_mac_history(){
 
   mac_history_cursor = 0;
 }
+
+void setup_id_pins(){
+  pinMode(13, INPUT_PULLUP); // IO13 is A/B identifier pin
+  pinMode(25, INPUT_PULLDOWN); // All other pins are board identifers
+  pinMode(26, INPUT_PULLDOWN);
+  pinMode(32, INPUT_PULLDOWN);
+  pinMode(33, INPUT_PULLDOWN);
+}
+
+byte read_id_pins(){
+  byte board_id = 0;
+  board_id = digitalRead(25);                     // shift bits to get a board ID
+  board_id = (board_id << 1) + digitalRead(26);
+  board_id = (board_id << 1) + digitalRead(32);
+  board_id = (board_id << 1) + digitalRead(33);
+
+  return board_id;
+}
+
