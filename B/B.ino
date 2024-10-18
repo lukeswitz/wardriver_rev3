@@ -137,15 +137,15 @@ void read_temperature(){
   else if (cfg == 0x20) raw = raw & ~3; // 10 bit res, 187.5 ms
   else if (cfg == 0x40) raw = raw & ~1; // 11 bit res, 375 ms
   //// default is 12 bit resolution, 750 ms conversion time
-  
-  float celsius = (float)raw / 16.0;
-  
+
+  float fahrenheit = ((float)raw / 16.0 * 9.0 / 5.0) + 32.0;
+
   Serial.print("Temperature = ");
-  Serial.println(celsius);
+  Serial.println(fahrenheit);
   await_serial();
   serial_lock = true;
   Serial1.print("TEMP,");
-  Serial1.println(celsius);
+  Serial1.println(fahrenheit);
   serial_lock = false;
 }
 
