@@ -2626,7 +2626,7 @@ void lcd_show_stats(){
   if (int(temperature) != 0){
     display.print(" T:");
     display.print(temperature);
-    display.print("c");
+    display.print("°F");
   }
   display.println();
   if (nmea.getHDOP() < 250 && nmea.getNumSatellites() > 0){
