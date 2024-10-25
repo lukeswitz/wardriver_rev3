@@ -5,6 +5,11 @@
 > [!NOTE]
 > This fork has options you might not need or want. **Review** and use at your own risk.
 
+#### Additional/Modded Features
+- MAC Randomization
+- Temperature in Fahrenheit
+---
+
 ## Introduction
 
 This repository is for the 3rd revision of the wardriver.uk created by [Joseph Hewitt](https://twitter.com/jhewitt_net). The wardriver.uk scans for nearby WiFi networks and Bluetooth devices and logs information about them to a CSV file which can be uploaded to [Wigle.net](https://wigle.net). A fully assembled Wardriver features 2 ESP32 modules, GPS, a SIM800L GSM module, an i2c LCD, a DS18B20 temperature sensor, and an SPI micro SD card reader/writer.
