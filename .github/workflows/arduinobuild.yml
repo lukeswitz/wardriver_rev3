@@ -6,7 +6,6 @@ on:
       - '*'
   pull_request:
     types: [ opened, reopened, edited, ready_for_review, review_requested ]
-
   workflow_dispatch:
 
 permissions:
@@ -17,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       
       - name: Preparation
         run: |
@@ -27,7 +26,7 @@ jobs:
       
       - name: Cache
         if: github.ref_type != 'tag'
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           key: "BUILDER_DIR-${{ env.cachehash }}"
           path: |
@@ -51,7 +50,6 @@ jobs:
             exit 0;
           fi
           echo "$FULLHASH" > ~/builder/source_hash.txt
-          
           
           if [ ! -e bin/arduino-cli ]; then
             echo "Downloading Arduino CLI"
@@ -91,9 +89,8 @@ jobs:
             cat /tmp/build.log >> $GITHUB_STEP_SUMMARY
           fi
           
-          
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: Binaries
           path: |
@@ -104,4 +101,3 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           file: /tmp/build.zip
-          
