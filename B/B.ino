@@ -92,13 +92,16 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
 
           String ble_name = advertisedDevice.getName().c_str();
           ble_name.replace(",","_");
-          
-          // Serial1.print("BL,");
-          // Serial1.print(advertisedDevice.getRSSI());
-          // Serial1.print(",");
-          // Serial1.print(advertisedDevice.getAddress().toString().c_str());
-          // Serial1.print(",");
-          // Serial1.println(ble_name);
+
+          await_serial();
+          serial_lock = true;
+          Serial1.print("BL,");
+          Serial1.print(advertisedDevice.getRSSI());
+          Serial1.print(",");
+          Serial1.print(advertisedDevice.getAddress().toString().c_str());
+          Serial1.print(",");
+          Serial1.println(ble_name);
+          serial_lock = false;
         }
       }
     }
@@ -242,6 +245,7 @@ void setup() {
     Serial.println("Using BW16 instead of SIM800L");
   }
 
+  Serial2.setRxBufferSize(8192); //increase buffer for BW16 scan data
   Serial2.begin(baud_rate,SERIAL_8N1,16,17); //SIM800L/BW16
   delay(50);
   if (!using_bw16){
@@ -406,202 +410,209 @@ void loop() {
     }
   }
 
+  BLEScanResults* foundDevices = pBLEScan->start(1.0, false);
   await_serial();
   serial_lock = true;
-  BLEScanResults* foundDevices = pBLEScan->start(1.8, false);
   Serial1.print("BLC,");
   Serial1.println(ble_found);
   serial_lock = false;
   Serial.print("Devices found: ");
   Serial.println(ble_found);
   Serial.println("Scan done!");
-  pBLEScan->clearResults();   // delete results fromBLEScan buffer to release memory
+  pBLEScan->clearResults();
   yield();
   ble_found = 0;
-  if (last_temperature == 0 || millis() - last_temperature > 15000){
+  
+  if (last_temperature == 0 || millis() - last_temperature > 15000) {
     read_temperature();
     request_temperature();
     last_temperature = millis();
   }
   
-  //This side will only scan a subset of channels defined below; most scan time is dedicated to Bluetooth here.
-  for (int y = 0; y < 6; y++){
-    switch(wifi_scan_channel){
-      case 1:
-        wifi_scan_channel = 6;
-        break;
-      case 6:
-        wifi_scan_channel = 11;
-        break;
-      case 11:
-        wifi_scan_channel = 12;
-        break;
-      case 12:
-        wifi_scan_channel = 13;
-        break;
-      case 13:
-        wifi_scan_channel = 14;
-        break;
-      default:
-        wifi_scan_channel = 1;
-    }
-  
-    //scanNetworks(bool async, bool show_hidden, bool passive, uint32_t max_ms_per_chan, uint8_t channel)
-    int n = WiFi.scanNetworks(false,true,false,110,wifi_scan_channel);
+  // Only scan the standard US channels
+  int wifi_channels[] = {1, 6, 11};
+  for (int i = 0; i < 3; i++) {
+    wifi_scan_channel = wifi_channels[i];
+    
+    int n = WiFi.scanNetworks(false, true, false, 100, wifi_scan_channel);
     Serial.print("Scan of channel ");
     Serial.print(wifi_scan_channel);
     Serial.print(" returned ");
     Serial.println(n);
-    if (n > 0){
-      for (int i = 0; i < n; i++) {
-        uint8_t *this_bssid_raw = WiFi.BSSID(i);
+    
+    if (n > 0) {
+      for (int j = 0; j < n; j++) {
+        uint8_t *this_bssid_raw = WiFi.BSSID(j);
         char this_bssid[18] = {0};
         sprintf(this_bssid, "%02X:%02X:%02X:%02X:%02X:%02X", this_bssid_raw[0], this_bssid_raw[1], this_bssid_raw[2], this_bssid_raw[3], this_bssid_raw[4], this_bssid_raw[5]);
-        if (seen_mac(this_bssid_raw)){
+        if (seen_mac(this_bssid_raw)) {
           continue;
         }
         save_mac(this_bssid_raw);
 
-        String ssid = WiFi.SSID(i);
-        ssid.replace(",","_");
+        String ssid = WiFi.SSID(j);
+        ssid.replace(",", "_");
 
         await_serial();
         serial_lock = true;
-        Serial1.printf("WI%d,%s,%d,%d,%d,%s\n", 0, ssid.c_str(), WiFi.channel(i), WiFi.RSSI(i), WiFi.encryptionType(i), this_bssid);
+        Serial1.printf("WI%d,%s,%d,%d,%d,%s\n", 0, ssid.c_str(), WiFi.channel(j), WiFi.RSSI(j), WiFi.encryptionType(j), this_bssid);
         serial_lock = false;
       }
     }
+    yield();
   }
 }
 
-void loop2( void * parameter) {
+void loop2(void * parameter) {
   boolean had_gsm_data = false;
   int count_5ghz = 0;
+  
   while (true) {
     yield();
-    delay(10);
-    while (Serial1.available()){
-      //ESP A rarely talks to us, but it's usually important
+    
+    // Process any commands from ESP A
+    while (Serial1.available()) {
       String a_buff = Serial1.readStringUntil('\n');
-      if (a_buff.startsWith("FWUP:")){
+      if (a_buff.startsWith("FWUP:")) {
         Serial.println("Core2 OTA prep");
         ota_hash = a_buff.substring(5);
         ota_mode = true;
-        while (ota_mode){
-          //Keep this core busy
+        while (ota_mode) {
           yield();
         }
       }
-      
     }
-    String s2buf = Serial2.readStringUntil('\n');
-    if (s2buf.length() >= 2){
+    
+    // Check for BW16/SIM800L data with non-blocking read
+    if (Serial2.available()) {
+      // Read with timeout to prevent blocking
+      String s2buf = "";
+      unsigned long start_time = millis();
+      while (Serial2.available() && (millis() - start_time < 200)) {
+        char c = Serial2.read();
+        s2buf += c;
+        if (c == '\n') break;
+      }
       
-     if (s2buf.length() > 30){
-       if (!using_bw16){
-         await_serial();
-         serial_lock = true;
-         Serial1.print("GSM,");
-         Serial1.print(s2buf);
-         had_gsm_data = true;
-         Serial1.println();
-         serial_lock = false;
-       } else {
-        //Parse BW16 line here.
-        String ssid = "";
-        int channel = 0;
-        int rssi = 0;
-        int enc_type = 0;
-        String mac = "";
-
-        #define mac_len 18
-
-        mac = s2buf.substring(s2buf.length()-mac_len);
-        mac.toUpperCase();
-
-        int pos = mac_len+1;
-        int previous_pos = pos;
-        int counter = 0;
-        while (pos <= s2buf.length()){
-          pos++;
-          if (s2buf.charAt(s2buf.length()-pos) != ','){
-            continue;
-          }
-
-          counter++;
-          String match = s2buf.substring(s2buf.length()-pos+1, s2buf.length()-previous_pos);
-          
-
-          if (counter == 1){
-            //RSSI
-            rssi = match.toInt();
-          }
-          if (counter == 2){
-            //Security type
-            if (match.indexOf("WPA2 AES") > -1 || match.indexOf("WPA2 TKIP") > -1) {
-              enc_type = WIFI_AUTH_WPA2_PSK;
-            }
-            if (match.indexOf("WPA2") > -1 && enc_type == 0) {
-              enc_type = WIFI_AUTH_WPA2_ENTERPRISE;
-            }
-            if (match.indexOf("WPA") > -1 && enc_type == 0) {
-              enc_type = WIFI_AUTH_WPA_PSK;
-            }
-            if (match.indexOf("WPA3") > -1 && enc_type == 0) {
-              enc_type = WIFI_AUTH_WPA3_PSK;
-            }
-            if (match.indexOf("None") > -1 && enc_type == 0) {
-              enc_type = WIFI_AUTH_OPEN;
-            }
-          }
-          if (counter == 3){
-            //Channel
-            channel = match.toInt();
-            if (channel > 14){
-              count_5ghz++;
-            }
-
-            int comma_pos = s2buf.indexOf(",")+1;
-
-            ssid = s2buf.substring(comma_pos, s2buf.length()-pos);
-          }
-          if (counter >= 4){
-            break;
-          }
-
-          previous_pos = pos;
-          
-        }
-        
-        await_serial();
-        serial_lock = true;
-        Serial.printf("WI%d,%s,%d,%d,%d,%s\n", 0, ssid.c_str(), channel, rssi, enc_type, mac.c_str());
-        Serial1.printf("WI%d,%s,%d,%d,%d,%s\n", 0, ssid.c_str(), channel, rssi, enc_type, mac.c_str());
-        serial_lock = false;
-       }
-      } else {
-        //Short line, normally we discard this
-        if (using_bw16){
-          if (s2buf.indexOf("[ATWS]") > -1){
-            had_gsm_data = true;
+      if (s2buf.length() >= 2) {
+        if (s2buf.length() > 30) {
+          if (!using_bw16) {
             await_serial();
             serial_lock = true;
-            Serial1.print("5G,");
-            Serial1.print(count_5ghz);
-            Serial1.print("\n");
+            Serial1.print("GSM,");
+            Serial1.print(s2buf);
+            had_gsm_data = true;
+            Serial1.println();
             serial_lock = false;
-            Serial.print("BW16 done, 5GHz count: ");
-            Serial.println(count_5ghz);
-            count_5ghz = 0;
+          } else {
+            // Parse BW16 line - all existing code
+            String ssid = "";
+            int channel = 0;
+            int rssi = 0;
+            int enc_type = 0;
+            String mac = "";
+
+            #define mac_len 18
+
+            mac = s2buf.substring(s2buf.length()-mac_len);
+            mac.toUpperCase();
+
+            int pos = mac_len+1;
+            int previous_pos = pos;
+            int counter = 0;
+            while (pos <= s2buf.length()) {
+              pos++;
+              if (s2buf.charAt(s2buf.length()-pos) != ',') {
+                continue;
+              }
+
+              counter++;
+              String match = s2buf.substring(s2buf.length()-pos+1, s2buf.length()-previous_pos);
+              
+              if (counter == 1) {
+                rssi = match.toInt();
+              }
+              if (counter == 2) {
+                // Security type parsing (unchanged)
+                if (match.indexOf("WPA2 AES") > -1 || match.indexOf("WPA2 TKIP") > -1 || match.indexOf("WPA2 PSK") > -1) {
+                  enc_type = WIFI_AUTH_WPA2_PSK;
+                }
+                if ((match.indexOf("WPA2/WPA3 PSK") > -1) && enc_type == 0) {
+                  enc_type = WIFI_AUTH_WPA2_WPA3_PSK;
+                }
+                if ((match.indexOf("WPA3") > -1 || match.indexOf("WPA3 PSK") > -1) && enc_type == 0) {
+                  enc_type = WIFI_AUTH_WPA3_PSK;
+                }
+                if ((match.indexOf("WPA/WPA2 PSK") > -1) && enc_type == 0) {
+                  enc_type = WIFI_AUTH_WPA_WPA2_PSK;
+                }
+                if ((match.indexOf("WPA Enterprise") > -1 || match.indexOf("WPA2 Enterprise") > -1 || match.indexOf("WPA/WPA2 Enterprise") > -1) && enc_type == 0) {
+                  enc_type = WIFI_AUTH_ENTERPRISE;
+                }
+                if ((match.indexOf("WPA2") > -1 || match.indexOf("WPA2 Enterprise") > -1) && enc_type == 0) {
+                  enc_type = WIFI_AUTH_WPA2_ENTERPRISE;
+                }
+                if ((match.indexOf("WPA") > -1 || match.indexOf("WPA PSK") > -1) && enc_type == 0) {
+                  enc_type = WIFI_AUTH_WPA_PSK;
+                }
+                if ((match.indexOf("None") > -1 || match.indexOf("Open") > -1) && enc_type == 0) {
+                  enc_type = WIFI_AUTH_OPEN;
+                }
+                if ((match.indexOf("WEP") > -1) && enc_type == 0) {
+                  enc_type = WIFI_AUTH_WEP;
+                }
+              }
+              if (counter == 3) {
+                channel = match.toInt();
+                if (channel > 14) {
+                  count_5ghz++;
+                }
+
+                int comma_pos = s2buf.indexOf(",")+1;
+                ssid = s2buf.substring(comma_pos, s2buf.length()-pos);
+              }
+              if (counter >= 4) {
+                break;
+              }
+
+              previous_pos = pos;
+            }
+            
+            await_serial();
+            serial_lock = true;
+            Serial.printf("WI%d,%s,%d,%d,%d,%s\n", 0, ssid.c_str(), channel, rssi, enc_type, mac.c_str());
+            Serial1.printf("WI%d,%s,%d,%d,%d,%s\n", 0, ssid.c_str(), channel, rssi, enc_type, mac.c_str());
+            serial_lock = false;
+          }
+        } else {
+          // Short line handling specifically for ATWS marker
+          if (using_bw16) {
+            if (s2buf.indexOf("[ATWS]") > -1) {
+              had_gsm_data = true;
+              await_serial();
+              serial_lock = true;
+              Serial1.print("5G,");
+              Serial1.print(count_5ghz);
+              Serial1.print("\n");
+              serial_lock = false;
+              Serial.print("BW16 done, 5GHz count: ");
+              Serial.println(count_5ghz);
+              count_5ghz = 0;
+            }
           }
         }
       }
     } else {
-      if (last_sim_request == 0 || millis() - last_sim_request > 15000 || had_gsm_data == true){
-        if (!using_bw16){
+      // Send ATWS command more frequently (7s instead of 15s)
+      if (last_sim_request == 0 || millis() - last_sim_request > 7000 || had_gsm_data == true) {
+        if (!using_bw16) {
           Serial2.print("AT+CNETSCAN\r\n");
           Serial.println("Requesting data from SIM");
         } else {
+          // For BW16, first clear any pending data
+          while (Serial2.available()) {
+            Serial2.read();
+          }
           Serial2.print("ATWS\r\n");
           Serial.println("Requesting data from BW16");
         }
@@ -609,6 +620,7 @@ void loop2( void * parameter) {
         had_gsm_data = false;
       }
     }
+    delay(10);
   }
 }
 
